@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "resources/ocr/pp-ocrv6_tiny_det.onnx": "resources/ocr/pp-ocrv6_tiny_det.onnx",
+      "resources/ocr/pp-ocrv6_tiny_rec.onnx": "resources/ocr/pp-ocrv6_tiny_rec.onnx",
+      "resources/ocr/ppocrv6_tiny_dict.txt": "resources/ocr/ppocrv6_tiny_dict.txt"
+    }
+  }
+}

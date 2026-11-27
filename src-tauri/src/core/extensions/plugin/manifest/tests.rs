@@ -1,0 +1,296 @@
+use super::*;
+
+fn manifest(body: &str) -> Result<PluginManifest> {
+    PluginManifest::parse(&format!(
+        r#"id = "org.test.plugin"
+name = "Test"
+version = "1.0.0"
+protocol = 2
+library = "test"
+{body}"#
+    ))
+}
+
+#[test]
+fn versions_are_semantic_and_attribution_is_one_line() {
+    let parse = |header: &str| {
+        PluginManifest::parse(&format!(
+            "id = \"org.test.version\"\nname = \"V\"\n{header}\nprotocol = 2\nlibrary = \"v\"\n"
+        ))
+    };
+    let described = parse(
+        "version = \"1.2.0-rc.1\"\ndescription = \"分析 Linux 系统\"\npublisher = \"LovelyTeams\"\nlicense = \"GPL-3.0-only\"",
+    )
+    .expect("described package");
+    assert_eq!(
+        described.semantic_version().expect("version"),
+        semver::Version::parse("1.2.0-rc.1").expect("version")
+    );
+    assert_eq!(described.description.as_deref(), Some("分析 Linux 系统"));
+    assert_eq!(described.publisher.as_deref(), Some("LovelyTeams"));
+    assert_eq!(described.license.as_deref(), Some("GPL-3.0-only"));
+    for header in [
+        "version = \"1\"",
+        "version = \"1.0\"",
+        "version = \"v1.0.0\"",
+        "version = \"1.0.0\"\ndescription = \"\"",
+        "version = \"1.0.0\"\ndescription = \"两行\\n说明\"",
+        "version = \"1.0.0\"\npublisher = \"   \"",
+    ] {
+        assert!(
+            matches!(parse(header), Err(PluginError::Manifest(_))),
+            "{header} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn repository_packages_stay_valid() {
+    let plugins = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("plugins");
+    let linuxinfo = PluginManifest::load(&plugins.join("linuxinfo").join("plugin.toml"))
+        .expect("linuxinfo manifest");
+    assert_eq!(linuxinfo.id, "org.lovelycarve.linuxinfo");
+    let base = linuxinfo.analyzer("linuxbaseinfo").expect("base analyzer");
+    assert_eq!(base.scope, AnalyzerScope::System);
+    assert!(base.applies_to_family("linux"));
+    assert!(!base.applies_to_family("windows"));
+    assert_eq!(base.provides, vec!["timezone", "hostname", "users"]);
+    assert_eq!(base.options[0].kind, OptionKind::Multi);
+    assert_eq!(base.options[0].default_json(), serde_json::json!([]));
+    assert_eq!(linuxinfo.memory_limit().expect("memory"), 1 << 30);
+}
+
+#[test]
+fn lpp_v1_manifests_explain_the_rebuild() {
+    let Err(PluginError::Manifest(message)) = PluginManifest::parse(
+        r#"id = "org.test.legacy"
+name = "Legacy"
+version = "1.0.0"
+protocol_min = 1
+protocol_max = 1
+[library]
+path = "legacy"
+"#,
+    ) else {
+        panic!("v1 manifest must be rejected");
+    };
+    assert!(message.contains("LPP v1"), "{message}");
+    assert!(manifest("").is_ok());
+    let Err(PluginError::Manifest(message)) = PluginManifest::parse(
+        r#"id = "org.test.future"
+name = "Future"
+version = "1.0.0"
+protocol = 3
+library = "future"
+"#,
+    ) else {
+        panic!("protocol 3 must be rejected");
+    };
+    assert!(message.contains("protocol 3"), "{message}");
+}
+
+#[test]
+fn analyzer_fields_must_fit_their_scope() {
+    for body in [
+        // Platforms are for systems.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"evidence\"\nplatforms = [\"linux\"]",
+        // Unknown family.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\nplatforms = [\"beos\"]",
+        // Files runs take no inputs and never start on their own.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"files\"\ninputs = [\"etc/passwd\"]",
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"files\"\ntrigger = \"auto\"",
+        // Extensions are for files runs.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\nextensions = [\"db\"]",
+        // Inputs must be valid patterns.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\ninputs = [\"../etc\"]",
+        // Analyzer ids follow the SDK rule.
+        "[[analyzer]]\nid = \"Bad-Id\"\nname = \"A\"\nscope = \"system\"",
+        // Duplicate analyzers.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\n[[analyzer]]\nid = \"a\"\nname = \"B\"\nscope = \"system\"",
+        // Options need choices that match their defaults.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\n[[analyzer.option]]\nid = \"items\"\ntype = \"multi\"\nlabel = \"子项\"",
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\n[[analyzer.option]]\nid = \"mode\"\ntype = \"choice\"\nlabel = \"模式\"\nchoices = [{ id = \"fast\", label = \"快\" }]\ndefault = \"slow\"",
+        // Typos are errors.
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\ntriger = \"auto\"",
+        "memory = \"1TiB\"",
+        "permissions = [\"network\", \"network\"]",
+    ] {
+        assert!(
+            matches!(manifest(body), Err(PluginError::Manifest(_))),
+            "{body} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn dji_system_analyzers_can_target_aircraft() {
+    let plugin = manifest("[[analyzer]]\nid = \"flight\"\nname = \"Flight\"\nscope = \"system\"\nplatforms = [\"dji\"]").expect("DJI system analyzer");
+    let analyzer = plugin.analyzer("flight").expect("flight analyzer");
+    assert!(analyzer.applies_to_family("dji"));
+    assert!(!analyzer.applies_to_family("linux"));
+}
+
+#[test]
+fn files_analyzers_match_by_extension_or_mime() {
+    let manifest = manifest(
+        "[[analyzer]]\nid = \"sqlite\"\nname = \"SQLite\"\nscope = \"files\"\nextensions = [\"db\", \"sqlite\"]\nmime_types = [\"application/vnd.sqlite3\"]",
+    )
+    .expect("manifest");
+    let analyzer = manifest.analyzer("sqlite").expect("analyzer");
+    assert!(analyzer.accepts_file("History.DB", None));
+    assert!(analyzer.accepts_file("blob", Some("application/vnd.sqlite3")));
+    assert!(!analyzer.accepts_file("notes.txt", Some("text/plain")));
+    assert_eq!(analyzer.trigger, TaskTrigger::Manually);
+}
+
+#[test]
+fn option_values_are_checked_against_their_kind() {
+    let manifest = manifest(
+        "[[analyzer]]\nid = \"a\"\nname = \"A\"\nscope = \"system\"\n[[analyzer.option]]\nid = \"items\"\ntype = \"multi\"\nlabel = \"子项\"\nchoices = [{ id = \"users\", label = \"用户\" }, { id = \"groups\", label = \"组\" }]",
+    )
+    .expect("manifest");
+    let option = &manifest.analyzer("a").expect("analyzer").options[0];
+    assert!(option.check(&serde_json::json!(["users"])).is_ok());
+    assert!(option.check(&serde_json::json!([])).is_ok());
+    assert!(option.check(&serde_json::json!(["shadow"])).is_err());
+    assert!(option.check(&serde_json::json!("users")).is_err());
+}
+
+#[test]
+fn library_paths_resolve_to_platform_file_names() {
+    let library = |path: &str| {
+        PluginManifest::parse(&format!(
+            "id = \"org.test.library\"\nname = \"L\"\nversion = \"1.0.0\"\nprotocol = 2\nlibrary = \"{path}\""
+        ))
+    };
+    let directory = Path::new("plugins").join("demo");
+    assert_eq!(
+        library("demo").expect("demo").library_path(&directory),
+        directory.join(format!("{DLL_PREFIX}demo{DLL_SUFFIX}"))
+    );
+    assert_eq!(
+        library("bin/demo").expect("bin").library_path(&directory),
+        directory
+            .join("bin")
+            .join(format!("{DLL_PREFIX}demo{DLL_SUFFIX}"))
+    );
+    assert_eq!(
+        library("custom.DLL").expect("dll").library_path(&directory),
+        directory.join("custom.DLL")
+    );
+    for escaping in ["../demo", "", "/abs/demo"] {
+        assert!(library(escaping).is_err(), "{escaping:?} must be rejected");
+    }
+}
+
+#[test]
+fn sizes_parse_binary_and_decimal_units() {
+    assert_eq!(parse_size("512MiB"), Some(512 << 20));
+    assert_eq!(parse_size("2GiB"), Some(2 << 30));
+    assert_eq!(parse_size("2048MB"), Some(2_048_000_000));
+    assert_eq!(parse_size("1073741824"), Some(1 << 30));
+    assert_eq!(parse_size("lots"), None);
+}
+
+#[test]
+fn analyzer_tool_manifest_parses_and_validates() {
+    let valid = manifest(
+        r#"
+[[analyzer]]
+id = "git_forensics"
+name = "Git 取证"
+scope = "evidence"
+[analyzer.tool]
+id = "git_workspace"
+label = "Git 仓库"
+icon = "GitBranch"
+view = "git_repo"
+item_record = "git.repo"
+item_key = "repo_path"
+item_label = "repo_name"
+item_sublabel = "repo_path"
+"#,
+    )
+    .expect("valid analyzer.tool manifest");
+    let tool = valid
+        .analyzer("git_forensics")
+        .expect("analyzer")
+        .tool
+        .as_ref()
+        .expect("tool");
+    assert_eq!(tool.id, "git_workspace");
+    assert_eq!(tool.view, "git_repo");
+    assert_eq!(tool.item_sublabel.as_deref(), Some("repo_path"));
+
+    let with_defaults = manifest(
+        r#"
+[[analyzer]]
+id = "git_forensics"
+name = "Git 取证"
+scope = "evidence"
+[analyzer.tool]
+id = "git_workspace"
+label = "Git 仓库"
+item_record = "git.repo"
+item_key = "repo_path"
+item_label = "repo_name"
+"#,
+    )
+    .expect("tool defaults");
+    let tool = with_defaults
+        .analyzer("git_forensics")
+        .unwrap()
+        .tool
+        .as_ref()
+        .unwrap();
+    assert_eq!(tool.icon, "Wrench");
+    assert_eq!(tool.view, "generic");
+    assert_eq!(tool.item_sublabel, None);
+
+    for bad in [
+        r#"
+[[analyzer]]
+id = "a"
+name = "A"
+scope = "evidence"
+[analyzer.tool]
+id = "Bad-Tool"
+label = "Git"
+item_record = "git.repo"
+item_key = "repo_path"
+item_label = "repo_name"
+"#,
+        r#"
+[[analyzer]]
+id = "a"
+name = "A"
+scope = "evidence"
+[analyzer.tool]
+id = "git_workspace"
+label = "   "
+item_record = "git.repo"
+item_key = "repo_path"
+item_label = "repo_name"
+"#,
+        r#"
+[[analyzer]]
+id = "a"
+name = "A"
+scope = "evidence"
+[analyzer.tool]
+id = "git_workspace"
+label = "Git"
+item_record = "git.repo"
+item_key = "repo_path"
+item_label = "repo_name"
+item_sublabel = ""
+"#,
+    ] {
+        assert!(
+            matches!(manifest(bad), Err(PluginError::Manifest(_))),
+            "{bad} must be rejected"
+        );
+    }
+}

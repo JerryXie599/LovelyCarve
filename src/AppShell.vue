@@ -1,0 +1,566 @@
+<template>
+  <Titlebar
+    :tabs="visibleTabs"
+    :active-tab-id="activeTabId"
+    :is-switching="isSwitching"
+    :is-busy="loading"
+    :case-name="activeCase?.name ?? null"
+    @open-settings="openSettings"
+    @open-case="showCaseManager = true"
+    @activate-tab="(id: string) => activateTab(id)"
+    @close-tab="handleTabClose"
+    @new-tab="handleOpenFile"
+  >
+    <template #workspace-actions>
+      <button
+        type="button"
+        class="ui-btn sm titlebar-chip"
+        :class="{ active: Boolean(cliSync?.active) }"
+        :disabled="!activeCase"
+        :title="cliSync?.active ? tr('CLI 同步已开启（端口 {0}），点击关闭', { 0: cliSync.port ?? '-' }) : tr('开启或关闭 CLI 与桌面端双向同步')"
+        @click="handleToggleCliSync"
+      >
+        <Terminal :size="14" />
+        <span class="titlebar-chip-label">{{ tr("CLI 同步") }}</span>
+        <span v-if="cliSync?.active" class="ui-dot running" aria-hidden="true"></span>
+      </button>
+      <button
+        type="button"
+        class="ui-btn sm titlebar-chip"
+        :class="{ active: activePanel === 'contest' }"
+        :title="tr('竞赛赛题、证据 Pin 与 Markdown Writeup 工作台')"
+        @click="toggleContestPanel"
+      >
+        <ClipboardCheck :size="14" /><span class="titlebar-chip-label">{{ tr("做题 / WP") }}</span>
+      </button>
+      <button type="button" class="ui-btn sm titlebar-chip" :title="tr('案件 IOC 汇总、案件字典与多核口令破解')" @click="showCaseIntelModal = true">
+        <Shield :size="14" /><span class="titlebar-chip-label">{{ tr("情报与破解") }}</span>
+      </button>
+      <button ref="taskHubTrigger" type="button" class="ui-btn sm titlebar-chip task-hub-trigger" :class="{ active: taskHubOpen }" :aria-expanded="taskHubOpen" aria-controls="task-hub" :aria-label="tr('任务中心')" :title="tr('任务列表与快速分析')" @click="toggleTaskHub">
+        <ListTodo :size="14" /><span class="titlebar-chip-label">{{ tr("任务中心") }}</span><span v-if="taskActiveCount" class="ui-dot running" aria-hidden="true"></span><span v-if="taskActiveCount" :key="taskActiveCount" class="ui-count accent ui-bump">{{ taskActiveCount.toLocaleString() }}</span>
+      </button>
+    </template>
+  </Titlebar>
+  <TaskHub
+    v-if="taskHubMounted"
+    ref="taskHubRef"
+    v-model:tab="taskHubTab"
+    :open="taskHubOpen"
+    :evidence="taskHubEvidence"
+    :session-image="imageInfo"
+    :evidence-name="taskHubEvidenceName"
+    :has-case="Boolean(activeCase)"
+    :active-count="taskActiveCount"
+    @close="closeTaskHub"
+    @open-case-manager="showCaseManager = true; closeTaskHub()"
+    @open-panel="openTaskResult"
+  />
+  <ToolSettingsModal
+    :visible="showToolSettings"
+    :initial-section="settingsInitialSection"
+    :plugin-install-link="pluginInstallLink"
+    @consume-plugin-install="pluginInstallLink = null"
+    @close="showToolSettings = false"
+  />
+  <CaseManagerModal
+    :visible="showCaseManager"
+    :image-id="imageId"
+    :image-info="imageInfo"
+    @close="handleCaseManagerClose"
+    @open-evidence="onOpenCaseEvidence"
+    @evidence-removed="onCaseEvidenceRemoved"
+    @add-evidence="showCaseManager = false; handleOpenFile()"
+    @open-intel="showCaseManager = false; showCaseIntelModal = true"
+  />
+  <CaseIntelCrackerModal
+    :visible="showCaseIntelModal"
+    :case-name="activeCase?.name ?? null"
+    @close="showCaseIntelModal = false"
+  />
+  <AddImageDialog
+    :visible="showAddImageDialog"
+    @close="showAddImageDialog = false"
+    @select="onAddImageSelect"
+  />
+  <PhysicalDiskPicker
+    :visible="showPhysicalDiskPicker"
+    @close="onPhysicalDiskPickerClose"
+    @select="onPhysicalDiskSelect"
+  />
+  <RaidMemberDetectDialog
+    :visible="showRaidMemberDialog"
+    :members="raidMemberQueue"
+    :stack="raidMemberStack"
+    :detecting="raidMemberDetecting"
+    :opening="raidMemberOpening"
+    :error="raidMemberError"
+    :dragging="isDragOver"
+    @close="showRaidMemberDialog = false"
+    @add-members="addRaidMemberFiles"
+    @redetect="detectRaidMemberQueue"
+    @remove-member="removeRaidMember"
+    @confirm-open="confirmRaidMemberOpen"
+  />
+  <!-- Drag & Drop Overlay -->
+  <Transition name="fade">
+    <div v-if="isDragOver && !showRaidMemberDialog" class="drag-overlay">
+      <div class="drag-overlay-content">
+        <Upload :size="48" />
+        <span>{{ tr("松开以添加检材") }}</span>
+      </div>
+    </div>
+  </Transition>
+  <div class="main-layout">
+    <!-- Category rail and second-level navigation; pages share the same workspace. -->
+    <SidebarNav
+      v-if="showSidebarNav"
+      :groups="sidebarGroups"
+      :active-id="activePanel"
+      @select="handleSidebarSelect"
+    >
+      <template v-if="imageId" #sub-nav><ForensicQuickJumpNav :image-id="imageId" :platform="effectivePlatform" :is-ios-backup="isIosBackup" :is-harmony-backup="isHarmonyBackup" @jump="openResultLocation" /></template>
+      <template v-if="imageId" #tools-nav="{ select }"><PluginToolsNav :image-id="imageId" :active-panel="activePanel" @select="select" /></template>
+      <template v-if="imageId" #context="{ select }"><AnalysisResultsNav :image-id="imageId" @select="select('analysis')" /></template>
+    </SidebarNav>
+    <div class="editor-area">
+      <!-- Main Content Area -->
+      <div v-content-motion.rise="activePanel + ':' + imageId" class="content-area">
+        <EvidenceLoadPanel v-if="activeTab?.loadTaskId" :task-id="activeTab.loadTaskId" :path="activeTab.filePath" @tasks="toggleTaskHub" />
+        <template v-else>
+        <!-- 文件列表与搜索结果面板使用 KeepAlive：切换界面时保留目录状态，以及在途搜索的
+             事件订阅、进度、增量结果和滚动位置。其余面板与欢迎页照常按需挂载。 -->
+        <KeepAlive>
+          <DiskFileList
+            v-if="activePanel === 'files' && imageId"
+            ref="diskFileListRef"
+            :image-id="imageId"
+            :index-only="imageInfo?.index_only === true"
+            :volume-revision="imageInfo?.unlocked_partitions?.map(unlocked => unlocked.id).join(',') ?? ''"
+            :activate-preview="activateFilePreview"
+          />
+          <SearchResultsPanel
+            v-else-if="activePanel === 'search-results' && imageId"
+            :image-id="imageId"
+            @close="handleSidebarSelect('files')"
+            :locating="locatingResult"
+            @open-file="openResultLocation"
+          />
+          <CarvePanel
+            v-else-if="activePanel === 'carve' && imageId"
+            :image-id="imageId"
+            :image-info="imageInfo"
+          />
+          <TimelinePanel
+            v-else-if="activePanel === 'timeline' && imageId"
+            :image-id="imageId"
+            :locating="locatingResult"
+            @open-file="openResultLocation"
+          />
+          <AnalysisResultsPanel
+            v-else-if="activePanel === 'analysis' && imageId"
+            :image-id="imageId"
+            :locating="locatingResult"
+            @open-file="openResultLocation"
+            @quick-analysis="openQuickAnalysis()"
+          />
+          <PluginToolHostPanel
+            v-else-if="activePanel.startsWith('tool:') && imageId"
+            :image-id="imageId"
+            :tool-id="activePanel.slice(5)"
+            @open-file="openResultLocation"
+          />
+        </KeepAlive>
+
+        <!-- 缓存面板激活时，其余面板链整体不渲染（否则末尾欢迎页会同时出现）。 -->
+        <template v-if="!cachedPanelActive">
+        <ContestWorkbench
+          v-if="activePanel === 'contest'"
+          :has-loaded-image="Boolean(imageId)"
+          @open-case-manager="showCaseManager = true"
+          @back-to-evidence="activePanel = imageId ? 'files' : ''"
+        />
+
+        <DiskImageInfo
+          v-else-if="activePanel === 'dashboard' && imageId"
+          :info="imageInfo"
+          @open-image="onOpenImageFromInfo"
+        />
+
+        <WelcomeScreen
+          v-else
+          :busy="loading || isSwitching || isOpeningRecentCase"
+          :dragging="isDragOver"
+          :load-label="loading ? loadLabel : isOpeningRecentCase ? tr('正在打开案件…') : loadLabel"
+          :load-percent="loading && loadProgress?.total ? loadPercent : null"
+          :recent-cases="recentCases"
+          @open="handleOpenFile"
+          @open-case="showCaseManager = true"
+          @open-recent="handleOpenRecentCase"
+          @clear-recent="clearRecentCases"
+        />
+        </template>
+        </template>
+      </div>
+    </div>
+  </div>
+  <QuickPinModal />
+  <CaptureAnnotationOverlay />
+</template>
+
+<script setup lang="ts">
+import { tr } from './composables/useLocale';
+
+import './styles/workspace.css';
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { vContentMotion } from './composables/uiMotionDirectives';
+import WelcomeScreen from './app/components/WelcomeScreen.vue';
+import EvidenceLoadPanel from './app/components/EvidenceLoadPanel.vue';
+import { useResultNavigation } from './app/workflows/useResultNavigation';
+import { useEvidenceLinks } from './app/workflows/useEvidenceLinks';
+import { type FileListNavigator } from './features/files/model/navigation';
+import TaskHub from './features/tasks/components/TaskHub.vue';
+import { useRecentCases } from './features/cases/api';
+import Titlebar from './app/components/Titlebar.vue';
+import ToolSettingsModal from './features/settings/components/ToolSettingsModal.vue';
+import CaseManagerModal from './features/cases/components/CaseManagerModal.vue';
+import AddImageDialog from './features/evidence/components/AddImageDialog.vue';
+import CaseIntelCrackerModal from './features/cases/components/CaseIntelCrackerModal.vue';
+import PhysicalDiskPicker from './features/evidence/components/PhysicalDiskPicker.vue';
+import RaidMemberDetectDialog from './features/raid/components/RaidMemberDetectDialog.vue';
+import SidebarNav from './app/components/SidebarNav.vue';
+import AnalysisResultsNav from './features/analysis/components/AnalysisResultsNav.vue';
+import ForensicQuickJumpNav from './features/files/components/ForensicQuickJumpNav.vue';
+import { PluginToolsNav } from './features/tools/api';
+import { CarvePanel, ContestWorkbench, DiskFileList, DiskImageInfo, AnalysisResultsPanel, PluginToolHostPanel, SearchResultsPanel, TimelinePanel, KEPT_ALIVE_PANELS } from './app/workspace/panels';
+import QuickPinModal from './features/contest/components/QuickPinModal.vue';
+import CaptureAnnotationOverlay from './features/contest/components/CaptureAnnotationOverlay.vue';
+import { bindContestEvents, registerContestNavigator, useContestWorkspace } from './features/contest/api';
+import { ClipboardCheck, ListTodo, Shield, Terminal, Upload } from 'lucide-vue-next';
+import { useFileSession, useAutoDetectReport } from './features/evidence/api';
+import { useCaseSession } from './features/cases/api';
+import { useWorkspaceShell } from './app/workspace/useWorkspaceShell';
+import { useRaidMemberOpen } from './app/workflows/useRaidMemberOpen';
+import { useEvidenceOpen } from './app/workflows/useEvidenceOpen';
+import { useBcpImport } from './app/workflows/useBcpImport';
+import { useCaseWorkspace } from './app/workflows/useCaseWorkspace';
+import { bindWorkspaceServices } from './app/workflows/bindWorkspaceServices';
+import { useWorkspaceTaskHub } from './app/workspace/useWorkspaceTaskHub';
+import { useTabManager } from './app/workspace/useTabManager';
+import { notifyError, notifyInfo } from './composables/useToast';
+import { focusAnalysisResult } from './features/analysis/api';
+import type { SettingsSection } from './features/settings/model/types';
+import type { PluginInstallLink } from './lib/ipc/evidenceLinks';
+import type { ImageId } from './lib/ipc/ids';
+
+const { recentCases, clearRecentCases } = useRecentCases();
+const showToolSettings = ref(false);
+const settingsInitialSection = ref<SettingsSection>('appearance');
+const pluginInstallLink = shallowRef<PluginInstallLink | null>(null);
+
+function openSettings(section: SettingsSection = 'appearance') {
+  settingsInitialSection.value = section;
+  showToolSettings.value = true;
+}
+
+const {
+  isEvidenceMode,
+  loading,
+  loadProgress,
+  imageId,
+  imageInfo,
+  updateImageInfo,
+  pickFolder,
+  pickBcpFiles,
+  pickFiles,
+  openByPath,
+  resetSession: resetFileSession,
+  captureSnapshot: captureFileSession,
+  restoreSnapshot: restoreFileSession,
+} = useFileSession();
+
+// Forensic case + volume-snapshot session (global singleton). The active
+// case name shows in the titlebar; the manager modal handles create/open/
+// close + per-volume snapshot build/list.
+const { activeCase, refreshActive: refreshActiveCase, removeEvidence } = useCaseSession();
+const autoDetectReport = useAutoDetectReport(() => imageId.value);
+const effectivePlatform = computed(() => {
+  const ev = activeCase.value?.evidence.find(item => item.image_id === imageId.value);
+  if (ev?.manual_platform) return ev.manual_platform;
+  if (ev?.platform) return ev.platform;
+  if (imageInfo.value?.ios_backup) return 'ios';
+  if (imageInfo.value?.harmony_backup) return 'huaweihmos';
+  return autoDetectReport.value?.platform ?? '';
+});
+const isIosBackup = computed(() =>
+  Boolean(imageInfo.value?.ios_backup) ||
+  (effectivePlatform.value === 'ios' && Boolean(autoDetectReport.value?.is_backup)),
+);
+const isHarmonyBackup = computed(() =>
+  Boolean(imageInfo.value?.harmony_backup) ||
+  (effectivePlatform.value === 'huaweihmos' && Boolean(autoDetectReport.value?.is_backup)),
+);
+const supportsRawAnalysis = computed(() => !imageInfo.value?.index_only && imageInfo.value?.source_format !== 'folder');
+const {
+  showRaidMemberDialog, raidMemberQueue, raidMemberStack, raidMemberDetecting,
+  raidMemberOpening, raidMemberError, openRaidMemberDialog, addRaidMemberFiles, addRaidMemberPaths,
+  detectRaidMemberQueue, removeRaidMember, confirmRaidMemberOpen, detectRaid,
+} = useRaidMemberOpen({
+  activeCase, removeEvidence, pickFiles,
+  openImagePath: (path, options) => openImagePath(path, options),
+});
+// The "检测到完整 RAID 阵列，是否打开重组镜像？" confirm dialog lives in the
+// shared composable; opening the tab needs this shell's tab manager.
+const showCaseManager = ref(false);
+const {
+  taskActiveCount, taskHubOpen, taskHubMounted, taskHubTab,
+  taskHubEvidence, taskHubEvidenceName, closeTaskHub, openTaskResult, toggleTaskHub, openQuickAnalysis,
+} = useWorkspaceTaskHub({ activeCase, imageId, showCaseManager, showPanel: panel => { activePanel.value = panel; } });
+
+const showCaseIntelModal = ref(false);
+const importBcp = useBcpImport({
+  caseId: () => activeCase.value?.id,
+  onPublished: (loadedId, runId) => {
+    if (imageId.value === loadedId && (activePanel.value === 'dashboard' || activePanel.value === 'analysis')) {
+      focusAnalysisResult(runId);
+      activePanel.value = 'analysis';
+    }
+  },
+});
+
+const {
+  showAddImageDialog, showPhysicalDiskPicker, onPhysicalDiskSelect,
+  onPhysicalDiskPickerClose, onAddImageSelect, onOpenImageFromInfo, openBcpFilePaths,
+} = useEvidenceOpen({
+  pickFiles, pickFolder, pickBcpFiles, openRaidMemberDialog,
+  openImagePath: (path, options) => openImagePath(path, options),
+  openSelectedEvidence: path => openSelectedEvidence(path),
+  importBcp: path => { void importBcp(path, 'explicit'); },
+});
+
+const { onOpenCaseEvidence, onCaseEvidenceRemoved } = useCaseWorkspace({
+  openImagePath: (path, options) => openImagePath(path, options),
+  detectRaid,
+  tabs: () => tabs.value,
+  evidence: () => activeCase.value?.evidence ?? [],
+  caseDirectory: () => activeCase.value?.dir ?? null,
+  closeTab: id => { void closeTab(id); },
+});
+
+const {
+  activePanel,
+  isDragOver,
+  sidebarGroups,
+  handleOpenFile,
+  handleOpenRecentCase,
+  isOpeningRecentCase,
+  openImagePath,
+  openSelectedEvidence,
+  handleSidebarSelect,
+  clearPendingOpenRequest,
+  loadFileForTab,
+} = useWorkspaceShell({
+  isEvidenceMode,
+  supportsRawAnalysis,
+  openByPath,
+  onNeedCase: () => { showCaseManager.value = true; },
+  onOpenCaseEvidence,
+  onBcpFilesOpen: openBcpFilePaths,
+  onZipOpened: path => { void importBcp(path, 'detect-zip'); },
+  onRequestAddImage: () => { showAddImageDialog.value = true; },
+  onCaseGateSatisfied: () => { showCaseManager.value = false; },
+  onDroppedPaths: async paths => {
+    if (!showRaidMemberDialog.value) return false;
+    await addRaidMemberPaths(paths);
+    return true;
+  },
+});
+
+// Search and timeline share evidence-aware navigation, including virtual file nodes.
+const diskFileListRef = ref<FileListNavigator | null>(null);
+
+function activateFilePreview(previewImageId: ImageId): boolean {
+  if (imageId.value !== previewImageId) return false;
+  activePanel.value = 'files';
+  return true;
+}
+
+/** Open an evidence item of the active case as its tab, once it is ready. */
+async function openCaseImage(targetImageId: ImageId): Promise<void> {
+  const evidence = activeCase.value?.evidence.find(item => item.image_id === targetImageId);
+  if (!evidence) throw new Error(tr("来源检材不在当前案件中"));
+  const result = await openImagePath(evidence.path, { forceImage: !evidence.path.startsWith('assembled://'), quiet: true, waitUntilReady: true });
+  if (!result.ok) throw new Error(tr("无法打开来源检材：{0}", { 0: result.error }));
+}
+
+const { locating: locatingResult, openLocation: openResultLocation } = useResultNavigation({
+  caseKey: () => activeCase.value?.dir ?? null,
+  imageId: () => imageId.value,
+  openImage: async targetImageId => {
+    await openCaseImage(targetImageId);
+    return true;
+  },
+  showFiles: () => { activePanel.value = 'files'; },
+  isFilesActive: () => activePanel.value === 'files',
+  panel: () => diskFileListRef.value,
+  onError: message => notifyError(tr("定位失败"), message),
+});
+
+// lovelycarve:// links open evidence or send an install request to Settings.
+useEvidenceLinks({
+  activeCase: () => activeCase.value,
+  refreshActiveCase,
+  openCase: entry => {
+    showCaseManager.value = false;
+    return handleOpenRecentCase(entry);
+  },
+  openEvidence: async targetImageId => {
+    await openCaseImage(targetImageId);
+    activePanel.value = 'files';
+  },
+  openLocation: openResultLocation,
+  openPluginInstall: link => {
+    pluginInstallLink.value = link;
+    openSettings('market');
+  },
+  onError: (title, message) => notifyError(title, message),
+});
+
+function handleCaseManagerClose() {
+  showCaseManager.value = false;
+  clearPendingOpenRequest();
+}
+
+// 「检测到加密分区」提示的「前往解锁」按钮把用户带到镜像信息面板（加密卷解锁
+// 入口所在）。useFileSession 不持有面板状态，跳转由 bindWorkspaceServices 注入。
+
+// ── Multi-tab orchestrator wiring ─────────────────────────────────────
+//
+// Tabbar UI lives in Titlebar.vue; the singleton state lives in
+// `useTabManager`. We bridge the two here by registering the shell's
+// load / teardown / panel hooks. Doing this once at App setup keeps
+// `useTabManager` itself decoupled from the workspace details — the
+// composable is purely a state machine over `tabs[]`.
+const { tabs, visibleTabs, activeTab, activeTabId, isSwitching, activateTab, closeTab, closeAllTabs } = useTabManager();
+
+/** Tab × click → tear the tab down. */
+function handleTabClose(tabId: string): void {
+  const tab = tabs.value.find(t => t.id === tabId);
+  if (!tab) return;
+  closeTab(tabId);
+}
+bindWorkspaceServices({
+  resetFileSession, captureFileSession, restoreFileSession, updateImageInfo, loadFileForTab, loading,
+  activePanel, showToolSettings, closeAllTabs, handleSidebarSelect, onOpenImageFromInfo,
+});
+
+const loadPercent = computed(() => {
+  if (!loadProgress.value?.total) return 0;
+  return Math.min(100, Math.round((loadProgress.value.current / loadProgress.value.total) * 100));
+});
+
+// Loading-overlay text: phase + percent when a total is known. Falls back to
+// a generic spinner label before any image-load progress event arrives.
+const loadLabel = computed(() => {
+  const p = loadProgress.value;
+  if (!p) return tr("正在加载镜像…");
+  let label = p.stage;
+  if (p.total > 0) label += ` ${loadPercent.value}%`;
+  if (p.entries > 0) label += tr(" · {0} 条", { 0: p.entries.toLocaleString() });
+  return label;
+});
+
+const showSidebarNav = computed(() => sidebarGroups.value.length > 0);
+
+/** Panels kept alive by the `<KeepAlive>` block; while one of them is shown
+ *  the dashboard / welcome chain below must not render. */
+const cachedPanelActive = computed(() => Boolean(imageId.value) && (KEPT_ALIVE_PANELS.has(activePanel.value) || activePanel.value.startsWith('tool:')));
+
+// Right-click is silent by default: only editable fields keep the native
+// copy / paste menu. File rows, the hex view and other surfaces with their own
+// menus handle `contextmenu` themselves.
+function suppressNativeContextMenu(event: MouseEvent) {
+  const target = event.target as HTMLElement | null;
+  if (target?.closest('input, textarea') || target?.isContentEditable) return;
+  event.preventDefault();
+}
+
+const {
+  cliSync,
+  refreshWorkspace: refreshContestWorkspace,
+  refreshCliSync,
+  toggleCliSync,
+} = useContestWorkspace();
+
+function toggleContestPanel() {
+  if (activePanel.value === 'contest') {
+    activePanel.value = imageId.value ? 'files' : '';
+  } else {
+    activePanel.value = 'contest';
+    if (activeCase.value) {
+      void refreshContestWorkspace();
+    }
+  }
+}
+
+async function handleToggleCliSync() {
+  if (!activeCase.value) return;
+  try {
+    const next = await toggleCliSync(!(cliSync.value?.enabled ?? true));
+    notifyInfo(
+      next.active ? tr('CLI 同步已开启') : tr('CLI 同步已关闭'),
+      next.active && next.port ? tr('CLI 命令现在共享当前桌面状态（端口 {0}）', { 0: next.port }) : '',
+    );
+  } catch (err) {
+    notifyError(tr('切换 CLI 同步失败'), String(err));
+  }
+}
+
+watch(
+  () => activeCase.value?.dir ?? null,
+  dir => {
+    if (dir) {
+      void refreshContestWorkspace();
+      void refreshCliSync();
+    }
+  },
+  { immediate: true },
+);
+
+let unbindContestEvents: (() => void) | null = null;
+
+onMounted(() => {
+  void refreshActiveCase();
+  document.addEventListener('contextmenu', suppressNativeContextMenu);
+  registerContestNavigator({
+    openExhibitEvidence: async targetImageId => {
+      await openCaseImage(targetImageId as ImageId);
+      activePanel.value = 'files';
+    },
+    openPinTarget: async pin => {
+      const target = pin.target;
+      if (target.kind === 'custom') return;
+      if (target.kind === 'analysis_record') {
+        await openCaseImage(target.imageId as ImageId);
+        activePanel.value = 'analysis';
+        return;
+      }
+      await openResultLocation({
+        imageId: target.imageId as ImageId,
+        path: target.path,
+        ...(target.kind === 'hex_range' ? { offset: target.offset, length: target.length } : {}),
+      });
+    },
+    showContestPanel: () => {
+      activePanel.value = 'contest';
+    },
+  });
+  unbindContestEvents = bindContestEvents(() => {
+    void refreshActiveCase();
+  });
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('contextmenu', suppressNativeContextMenu);
+  unbindContestEvents?.();
+});
+</script>

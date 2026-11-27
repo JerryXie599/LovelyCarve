@@ -1,0 +1,880 @@
+use lovelycarve_plugin::{
+    protocol::WireRecord, record::SourceRef, FieldKind, FieldSchema, RecordSchema, Severity, Value,
+};
+
+use super::*;
+use crate::core::analysis::results::record_query::{
+    self, ColumnFilter, ColumnValuesQuery, RecordsQuery,
+};
+
+fn user_schema() -> RecordSchema {
+    RecordSchema::new("test.user", "用户")
+        .title("{name} ({uid})")
+        .field(FieldSchema::new("name", "用户名", FieldKind::Text).key())
+        .field(FieldSchema::new("uid", "UID", FieldKind::Int))
+        .field(FieldSchema::new("size", "大小", FieldKind::Size))
+        .field(FieldSchema::new("login", "登录", FieldKind::Timestamp).timeline("login"))
+        .field(FieldSchema::new("groups", "组", FieldKind::List))
+        .field(FieldSchema::new("admin", "管理员", FieldKind::Bool))
+}
+
+fn user(name: &str, uid: i64, login: Option<&str>) -> WireRecord {
+    WireRecord {
+        record_type: "test.user".to_owned(),
+        values: vec![
+            Value::from(name),
+            Value::from(uid),
+            Value::from(4096_u64),
+            login.map_or(Value::Nil, Value::from),
+            Value::Array(vec![Value::from("wheel"), Value::from("audio")]),
+            Value::Boolean(uid == 0),
+        ],
+        title: None,
+        severity: (uid == 0).then_some(Severity::High),
+        sources: vec![SourceRef::path("part:1", "etc/passwd").note(format!("uid {uid}"))],
+    }
+}
+
+fn begin(case_dir: &Path, run_id: &str, job: &str) {
+    begin_run(
+        case_dir,
+        "image",
+        &NewRun {
+            run_id,
+            job_key: job,
+            plugin_id: "org.test",
+            plugin_version: "1",
+            analyzer: "users",
+            analyzer_name: "用户",
+            category: "baseinfo",
+            target: &RunTarget {
+                kind: "system".to_owned(),
+                id: "linux@part:1".to_owned(),
+                label: "Linux · part:1".to_owned(),
+            },
+            options: &serde_json::json!({ "items": [] }),
+            profile: &serde_json::json!({}),
+            inputs: &[RunInput {
+                path: "etc/passwd".to_owned(),
+                root: Some("part:1".to_owned()),
+                root_path: Some("etc/passwd".to_owned()),
+                node_id: Some("ext4:12".to_owned()),
+                size: 64,
+            }],
+            schema_hash: "fnv1a64:0",
+            library_sha256: Some(
+                "a5f3c6a11b03839d46af9fb43c97c188a5f3c6a11b03839d46af9fb43c97c188",
+            ),
+            started_at: "2026-10-19T00:00:00Z",
+        },
+    )
+    .expect("begin run");
+}
+
+fn completion(faults: &ReadFaultReport) -> RunCompletion<'_> {
+    RunCompletion {
+        summary: Some("done"),
+        finished_at: "2026-10-19T00:00:05Z",
+        read_faults: faults,
+    }
+}
+
+fn page<'a>(run_id: &'a str, sort: Option<&'a str>, keyword: Option<&'a str>) -> RecordsQuery<'a> {
+    RecordsQuery {
+        run_id,
+        record_type: "test.user",
+        keyword,
+        filters: &[],
+        bcp_scope: None,
+        sort,
+        descending: false,
+        skip: 0,
+        limit: 100,
+    }
+}
+
+fn filter(column: &str, values: &[&str]) -> ColumnFilter {
+    ColumnFilter {
+        column: column.to_owned(),
+        values: values.iter().map(|value| value.to_string()).collect(),
+    }
+}
+
+#[test]
+fn property_layout_survives_stored_result_queries() {
+    let directory = tempfile::tempdir().expect("case");
+    begin(directory.path(), "properties", "org.test/properties");
+    let layout = lovelycarve_plugin::PropertyLayout::new("value").label("name");
+    let schema = RecordSchema::new("test.property", "属性")
+        .field(FieldSchema::new("name", "名称", FieldKind::Text).key())
+        .field(FieldSchema::new("value", "值", FieldKind::Text))
+        .properties(layout.clone());
+    let mut writer =
+        RecordWriter::open(directory.path(), "image", "properties", &[schema]).expect("writer");
+    writer
+        .insert_batch(&[WireRecord {
+            record_type: "test.property".to_owned(),
+            values: vec![Value::from("主机名"), Value::from("evidence-host")],
+            title: None,
+            severity: None,
+            sources: Vec::new(),
+        }])
+        .expect("insert");
+    drop(writer);
+    publish(
+        directory.path(),
+        "image",
+        "properties",
+        &completion(&ReadFaultReport::default()),
+    )
+    .expect("publish");
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("database");
+    let result = record_query::records_page(
+        &connection,
+        &RecordsQuery {
+            record_type: "test.property",
+            ..page("properties", None, None)
+        },
+    )
+    .expect("page");
+    assert_eq!(result.properties, Some(layout));
+    assert_eq!(result.items[0].values["value"], "evidence-host");
+}
+
+/// 列筛选与去重值统计:文本/数值/布尔列按勾选值过滤,空值匹配 NULL 与空串,
+/// 组合跨列相且;facet 在关键词与其它列筛选下统计、排除自身列、可截断。
+#[test]
+fn column_filters_and_value_facets() {
+    let directory = tempfile::tempdir().expect("case");
+    begin(directory.path(), "filters", "org.test/users#linux@part:1");
+    let mut writer =
+        RecordWriter::open(directory.path(), "image", "filters", &[user_schema()]).expect("writer");
+    writer
+        .insert_batch(&[
+            user("root", 0, Some("2026-01-01T08:00:00Z")),
+            user("daemon", 1, None),
+            user("alice", 1000, Some("2026-01-02T09:30:00Z")),
+            user("bob", 1001, None),
+        ])
+        .expect("insert");
+    drop(writer);
+    publish(
+        directory.path(),
+        "image",
+        "filters",
+        &completion(&ReadFaultReport::default()),
+    )
+    .expect("publish");
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("database");
+    let page_with = |filters: &[ColumnFilter], keyword: Option<&str>| {
+        record_query::records_page(
+            &connection,
+            &RecordsQuery {
+                filters,
+                ..page("filters", None, keyword)
+            },
+        )
+        .expect("page")
+    };
+
+    // 文本列:勾选值内匹配。
+    let names = page_with(&[filter("name", &["root", "alice"])], None);
+    assert_eq!(names.total, 2);
+    // 数值列按数值比较;布尔列接受 true/false。
+    assert_eq!(page_with(&[filter("uid", &["0", "1"])], None).total, 2);
+    assert_eq!(page_with(&[filter("admin", &["true"])], None).total, 1);
+    assert_eq!(page_with(&[filter("admin", &["false"])], None).total, 3);
+    // 数值列的空值只匹配 NULL;文本/时间列连空串一起算。
+    assert_eq!(page_with(&[filter("uid", &[""])], None).total, 0);
+    assert_eq!(page_with(&[filter("login", &[""])], None).total, 2);
+    // 不同列相且,关键词再过滤。
+    let combo = page_with(
+        &[
+            filter("name", &["root", "alice", "bob"]),
+            filter("uid", &["1001"]),
+        ],
+        None,
+    );
+    assert_eq!(combo.total, 1);
+    assert_eq!(combo.items[0].values["name"], "bob");
+    assert_eq!(page_with(&[filter("uid", &["0"])], Some("root")).total, 1);
+    assert_eq!(page_with(&[filter("uid", &["0"])], Some("bob")).total, 0);
+    // 未知列与解析不了的数值整体忽略该列条件,而不是报错或选出空集。
+    assert_eq!(page_with(&[filter("nope", &["x"])], None).total, 4);
+    assert_eq!(page_with(&[filter("uid", &["abc"])], None).total, 4);
+
+    let facet = |column: &str, filters: &[ColumnFilter], limit: i64| {
+        record_query::column_values(
+            &connection,
+            &ColumnValuesQuery {
+                run_id: "filters",
+                record_type: "test.user",
+                keyword: None,
+                column,
+                filters,
+                bcp_scope: None,
+                limit,
+            },
+        )
+        .expect("facet")
+    };
+    // 按计数降序,布尔值以 JSON 形式返回。
+    let admins = facet("admin", &[], 10);
+    assert_eq!(admins.total, 4);
+    assert!(!admins.truncated);
+    assert_eq!(admins.values[0].value, serde_json::json!(false));
+    assert_eq!(admins.values[0].count, 3);
+    assert_eq!(admins.values[1].value, serde_json::json!(true));
+    // 其它列的筛选参与统计。
+    let root_admin = facet("admin", &[filter("uid", &["0"])], 10);
+    assert_eq!(root_admin.total, 1);
+    assert_eq!(root_admin.values[0].value, serde_json::json!(true));
+    // 自身列的筛选不参与统计(勾选后清单不变)。
+    let own = facet("admin", &[filter("admin", &["true"])], 10);
+    assert_eq!(own.total, 4);
+    // NULL 归为一组;同计数按值升序。
+    let logins = facet("login", &[], 10);
+    assert_eq!(logins.values[0].value, serde_json::Value::Null);
+    assert_eq!(logins.values[0].count, 2);
+    assert_eq!(logins.values[1].value, "2026-01-01T08:00:00Z");
+    // 超过上限截断;未知列/未知类型为空。
+    let truncated = facet("name", &[], 2);
+    assert!(truncated.truncated);
+    assert_eq!(truncated.values.len(), 2);
+    assert_eq!(facet("nope", &[], 10).values.len(), 0);
+}
+
+#[test]
+fn staged_records_are_typed_validated_and_published_with_provenance() {
+    let directory = tempfile::tempdir().expect("case");
+    begin(directory.path(), "run_a", "org.test/users#linux@part:1");
+    let mut writer =
+        RecordWriter::open(directory.path(), "image", "run_a", &[user_schema()]).expect("writer");
+    assert_eq!(
+        writer
+            .insert_batch(&[
+                user("root", 0, Some("2024-04-01T10:00:00+08:00")),
+                user("kali", 1000, Some("2024-04-02 09:00:00")),
+                user("daemon", 1, None),
+            ])
+            .expect("batch"),
+        3
+    );
+    // A refused batch stores nothing.
+    let mut wrong = user("bad", 7, None);
+    wrong.values[1] = Value::from("seven");
+    let refused = writer.insert_batch(&[user("ok", 8, None), wrong]);
+    assert!(matches!(
+        refused,
+        Err(RecordWriteError::Rejected {
+            code: "INVALID_RECORD",
+            ..
+        })
+    ));
+    let mut unknown = user("x", 9, None);
+    unknown.record_type = "test.other".to_owned();
+    assert!(matches!(
+        writer.insert_batch(&[unknown]),
+        Err(RecordWriteError::Rejected {
+            code: "UNKNOWN_RECORD_TYPE",
+            ..
+        })
+    ));
+    writer
+        .warn(
+            "MALFORMED_LINE",
+            "第 2 行字段不足",
+            Some("etc/passwd"),
+            Some("ext4:12"),
+        )
+        .expect("warning");
+    assert_eq!(
+        (writer.records(), writer.warnings(), writer.time_points()),
+        (3, 1, 2)
+    );
+    drop(writer);
+
+    // Staging runs are invisible.
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("records.db");
+    assert!(record_query::published_runs(&connection)
+        .expect("runs")
+        .is_empty());
+
+    let faults = ReadFaultReport::from_regions(vec![crate::core::evidence::image::BadRegion {
+        offset: 512,
+        len: 512,
+    }]);
+    let published = publish(directory.path(), "image", "run_a", &completion(&faults))
+        .expect("publish")
+        .expect("published");
+    assert!(published.superseded.is_empty());
+    let runs = record_query::published_runs(&connection).expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        (
+            runs[0].record_count,
+            runs[0].warning_count,
+            runs[0].synthetic_bytes
+        ),
+        (3, 1, 512)
+    );
+
+    let sorted =
+        record_query::records_page(&connection, &page("run_a", Some("uid"), None)).expect("page");
+    assert_eq!(
+        sorted
+            .items
+            .iter()
+            .map(|record| record.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root (0)", "daemon (1)", "kali (1000)"]
+    );
+    let root = &sorted.items[0];
+    assert_eq!(root.severity.as_deref(), Some("high"));
+    assert_eq!(
+        serde_json::Value::Object(root.values.clone()),
+        serde_json::json!({
+            "name": "root",
+            "uid": 0,
+            "size": 4096,
+            "login": "2024-04-01T10:00:00+08:00",
+            "groups": ["wheel", "audio"],
+            "admin": true,
+        })
+    );
+    assert_eq!(root.sources[0].root.as_deref(), Some("part:1"));
+    assert_eq!(root.sources[0].note.as_deref(), Some("uid 0"));
+    assert_eq!(sorted.columns[3].kind, "timestamp");
+    assert_eq!(sorted.columns[3].timeline.as_deref(), Some("login"));
+
+    // Timestamps sort by instant, local times by wall clock; NULL first.
+    let by_login = record_query::records_page(&connection, &page("run_a", Some("login"), None))
+        .expect("by login");
+    assert_eq!(
+        by_login
+            .items
+            .iter()
+            .map(|record| record.values["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["daemon", "root", "kali"]
+    );
+    // Keywords search the title and every text-like column, lists included.
+    let audio = record_query::records_page(&connection, &page("run_a", None, Some("AUDIO")))
+        .expect("keyword");
+    assert_eq!(audio.total, 3);
+    let kali = record_query::records_page(&connection, &page("run_a", None, Some("kal")))
+        .expect("keyword");
+    assert_eq!(kali.total, 1);
+    let percent = record_query::records_page(&connection, &page("run_a", None, Some("%")))
+        .expect("literal percent");
+    assert_eq!(percent.total, 0);
+
+    let (detail, columns) =
+        record_query::record_detail(&connection, root.record_id.parse().expect("id"))
+            .expect("detail")
+            .expect("record");
+    assert_eq!(&detail, root);
+    assert_eq!(columns, sorted.columns);
+
+    let audit = record_query::run_audit(&connection, "run_a")
+        .expect("audit")
+        .expect("run");
+    assert_eq!(audit.state, "published");
+    assert_eq!(
+        audit.library_sha256.as_deref(),
+        Some("a5f3c6a11b03839d46af9fb43c97c188a5f3c6a11b03839d46af9fb43c97c188")
+    );
+    assert_eq!(audit.warnings[0].node_id.as_deref(), Some("ext4:12"));
+    assert_eq!(audit.inputs[0].path, "etc/passwd");
+    assert_eq!(audit.bad_regions.len(), 1);
+    assert_eq!(audit.record_types[0].count, 3);
+
+    // Only the zoned timestamp is a timeline point.
+    assert_eq!(
+        record_query::count_time_points(directory.path(), "image").expect("points"),
+        1
+    );
+}
+
+#[test]
+fn publication_replaces_the_job_and_refuses_discarded_runs() {
+    let directory = tempfile::tempdir().expect("case");
+    let job = "org.test/users#linux@part:1";
+    let faults = ReadFaultReport::default();
+    for run_id in ["run_old", "run_new"] {
+        begin(directory.path(), run_id, job);
+        let mut writer = RecordWriter::open(directory.path(), "image", run_id, &[user_schema()])
+            .expect("writer");
+        writer
+            .insert_batch(&[user("root", 0, None)])
+            .expect("batch");
+    }
+    publish(directory.path(), "image", "run_old", &completion(&faults))
+        .expect("publish old")
+        .expect("published");
+    let replaced = publish(directory.path(), "image", "run_new", &completion(&faults))
+        .expect("publish new")
+        .expect("published");
+    assert_eq!(replaced.superseded, vec!["run_old".to_owned()]);
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("records.db");
+    assert_eq!(
+        record_query::published_runs(&connection)
+            .expect("runs")
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_new"]
+    );
+    // The superseded run keeps its audit but no records.
+    let old = record_query::run_audit(&connection, "run_old")
+        .expect("audit")
+        .expect("old run");
+    assert_eq!(old.state, "superseded");
+    assert_eq!(
+        record_query::records_page(&connection, &page("run_old", None, None))
+            .expect("old page")
+            .total,
+        0
+    );
+    // Publishing again, or publishing a discarded run, does nothing.
+    assert_eq!(
+        publish(directory.path(), "image", "run_new", &completion(&faults)).expect("again"),
+        None
+    );
+    begin(directory.path(), "run_gone", job);
+    discard(directory.path(), "image", "run_gone").expect("discard");
+    assert_eq!(
+        publish(directory.path(), "image", "run_gone", &completion(&faults)).expect("discarded"),
+        None
+    );
+    assert!(remove_run(directory.path(), "image", "run_new").expect("remove"));
+    assert!(!remove_run(directory.path(), "image", "run_new").expect("again"));
+    let records: i64 = connection
+        .query_row("SELECT COUNT(*) FROM record", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(records, 0, "removal cascades to the records");
+}
+
+#[test]
+fn staging_runs_of_an_exited_process_are_cleared() {
+    let directory = tempfile::tempdir().expect("case");
+    begin(directory.path(), "run_crashed", "org.test/users#");
+    let mut writer = RecordWriter::open(directory.path(), "image", "run_crashed", &[user_schema()])
+        .expect("writer");
+    writer
+        .insert_batch(&[user("root", 0, None)])
+        .expect("batch");
+    drop(writer);
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("records.db");
+    connection
+        .execute("UPDATE run SET owner = 'exited-process'", [])
+        .expect("simulate a crashed process");
+    begin(directory.path(), "run_next", "org.test/users#");
+    let runs: Vec<String> = connection
+        .prepare("SELECT run_id FROM run")
+        .expect("statement")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("runs");
+    assert_eq!(runs, vec!["run_next".to_owned()]);
+    let records: i64 = connection
+        .query_row("SELECT COUNT(*) FROM record", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(records, 0);
+}
+
+fn fact_schema() -> RecordSchema {
+    RecordSchema::new(record_query::PROFILE_FACT, "检材画像")
+        .title("{key}")
+        .field(FieldSchema::new("key", "键", FieldKind::Text).key())
+        .field(FieldSchema::new("value", "值", FieldKind::Json))
+        .field(FieldSchema::new("system", "系统", FieldKind::Text))
+}
+
+/// Publishes one run on `target` (empty: the whole evidence) holding `facts`.
+fn publish_facts(case_dir: &Path, run_id: &str, target: &str, facts: &[(&str, &str)]) {
+    begin_run(
+        case_dir,
+        "image",
+        &NewRun {
+            run_id,
+            job_key: &format!("org.test/facts#{target}"),
+            plugin_id: "org.test",
+            plugin_version: "1",
+            analyzer: "facts",
+            analyzer_name: "画像",
+            category: "baseinfo",
+            target: &RunTarget {
+                kind: if target.is_empty() {
+                    "evidence"
+                } else {
+                    "system"
+                }
+                .to_owned(),
+                id: target.to_owned(),
+                label: target.to_owned(),
+            },
+            options: &serde_json::json!({}),
+            profile: &serde_json::json!({}),
+            inputs: &[],
+            schema_hash: "fnv1a64:0",
+            library_sha256: None,
+            started_at: "2026-10-19T00:00:00Z",
+        },
+    )
+    .expect("begin run");
+    let mut writer =
+        RecordWriter::open(case_dir, "image", run_id, &[fact_schema()]).expect("writer");
+    let records: Vec<WireRecord> = facts
+        .iter()
+        .map(|(key, value)| WireRecord {
+            record_type: record_query::PROFILE_FACT.to_owned(),
+            values: vec![Value::from(*key), Value::from(*value), Value::Nil],
+            title: None,
+            severity: None,
+            sources: Vec::new(),
+        })
+        .collect();
+    writer.insert_batch(&records).expect("facts");
+    publish(
+        case_dir,
+        "image",
+        run_id,
+        &completion(&ReadFaultReport::default()),
+    )
+    .expect("publish")
+    .expect("published");
+}
+
+#[test]
+fn profile_facts_of_a_target_include_the_whole_evidence() {
+    let directory = tempfile::tempdir().expect("case");
+    publish_facts(
+        directory.path(),
+        "run_evidence",
+        "",
+        &[("timezone", "UTC"), ("hostname", "evidence")],
+    );
+    publish_facts(
+        directory.path(),
+        "run_kali",
+        "linux@part:1",
+        &[("hostname", "kali")],
+    );
+    publish_facts(
+        directory.path(),
+        "run_other",
+        "linux@part:2",
+        &[("hostname", "other"), ("users", "3")],
+    );
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("records.db");
+    let facts = |target: &str| -> Vec<(String, serde_json::Value)> {
+        record_query::profile_facts(&connection, target)
+            .expect("facts")
+            .into_iter()
+            .collect()
+    };
+    let text = |key: &str, value: &str| (key.to_owned(), serde_json::json!(value));
+    assert_eq!(
+        facts("linux@part:1"),
+        vec![text("hostname", "kali"), text("timezone", "UTC")]
+    );
+    assert_eq!(
+        facts(""),
+        vec![text("hostname", "evidence"), text("timezone", "UTC")]
+    );
+    assert_eq!(
+        facts("linux@part:2"),
+        vec![
+            text("hostname", "other"),
+            text("timezone", "UTC"),
+            text("users", "3")
+        ]
+    );
+}
+
+#[test]
+fn readers_never_create_the_store() {
+    let directory = tempfile::tempdir().expect("case");
+    assert!(record_query::open(directory.path(), "image")
+        .expect("open")
+        .is_none());
+    assert_eq!(
+        record_query::max_published_at(directory.path(), "image").expect("watermark"),
+        ""
+    );
+    discard(directory.path(), "image", "run_x").expect("discard without a store");
+    assert!(!crate::core::casework::case_paths::evidence_db_path(
+        directory.path(),
+        "image",
+        EvidenceDb::Records
+    )
+    .exists());
+}
+
+#[test]
+fn chat_layout_roundtrips_and_threads_summarize_correctly() {
+    let directory = tempfile::tempdir().expect("case");
+    let chat_schema = RecordSchema::new("test.chat", "聊天记录")
+        .field(FieldSchema::new("thread_id", "会话ID", FieldKind::Text).key())
+        .field(FieldSchema::new("thread_name", "会话名称", FieldKind::Text))
+        .field(FieldSchema::new("sender", "发送方", FieldKind::Text))
+        .field(FieldSchema::new("direction", "方向", FieldKind::Text))
+        .field(FieldSchema::new("time", "时间", FieldKind::Timestamp).timeline("sent"))
+        .field(FieldSchema::new("msg_type", "类型", FieldKind::Text))
+        .field(FieldSchema::new("content", "内容", FieldKind::Text))
+        .chat(
+            lovelycarve_plugin::ChatLayout::new("thread_id", "content")
+                .thread_title("thread_name")
+                .sender("sender")
+                .direction("direction")
+                .outgoing_values(vec!["发出".to_owned()])
+                .time("time")
+                .msg_type("msg_type"),
+        );
+    let schemas = [user_schema(), chat_schema];
+
+    let msg = |thread_id: &str,
+               thread_name: Option<&str>,
+               sender: &str,
+               direction: &str,
+               time: Option<&str>,
+               msg_type: &str,
+               content: &str| WireRecord {
+        record_type: "test.chat".to_owned(),
+        values: vec![
+            Value::from(thread_id),
+            thread_name.map_or(Value::Nil, Value::from),
+            Value::from(sender),
+            Value::from(direction),
+            time.map_or(Value::Nil, Value::from),
+            Value::from(msg_type),
+            Value::from(content),
+        ],
+        title: Some(format!("{sender}: {content}")),
+        severity: None,
+        sources: Vec::new(),
+    };
+
+    begin(directory.path(), "run_chat", "org.test/chat#ios@part:1");
+    let mut writer =
+        RecordWriter::open(directory.path(), "image", "run_chat", &schemas).expect("writer");
+    writer
+        .insert_batch(&[
+            user("alice", 1000, None),
+            msg(
+                "chat-a",
+                Some("项目群"),
+                "张三",
+                "收到",
+                Some("2026-08-01T10:00:00+08:00"),
+                "文本",
+                "早安",
+            ),
+            msg(
+                "chat-a",
+                None,
+                "我",
+                "发出",
+                Some("2026-08-01T10:05:00+08:00"),
+                "文本",
+                "收到方案",
+            ),
+            msg(
+                "chat-b",
+                Some("李四"),
+                "李四",
+                "收到",
+                Some("2026-08-01T11:00:00+08:00"),
+                "图片",
+                "",
+            ),
+            msg(
+                "chat-a",
+                Some("项目群"),
+                "张三",
+                "收到",
+                Some("2026-08-01T12:00:00+08:00"),
+                "投票",
+                "午餐吃什么",
+            ),
+        ])
+        .expect("insert");
+    drop(writer);
+    let faults = ReadFaultReport::default();
+    publish(directory.path(), "image", "run_chat", &completion(&faults)).expect("publish");
+
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("records.db");
+
+    // ChatLayout persists through records_page.
+    let chat_page = record_query::records_page(
+        &connection,
+        &RecordsQuery {
+            run_id: "run_chat",
+            record_type: "test.chat",
+            keyword: None,
+            filters: &[],
+            bcp_scope: None,
+            sort: None,
+            descending: false,
+            skip: 0,
+            limit: 20,
+        },
+    )
+    .expect("chat page");
+    assert_eq!(chat_page.total, 4);
+    let chat_layout = chat_page.chat.expect("chat layout preserved");
+    assert_eq!(chat_layout.thread_id, "thread_id");
+    assert_eq!(chat_layout.outgoing_values, vec!["发出"]);
+
+    // Threads grouped & ordered by latest message timestamp DESC.
+    let threads = record_query::chat_threads(
+        &connection,
+        &record_query::ChatThreadsQuery {
+            run_id: "run_chat",
+            record_type: "test.chat",
+            keyword: None,
+            filters: &[],
+            bcp_scope: None,
+            skip: 0,
+            limit: 50,
+        },
+    )
+    .expect("threads");
+    assert_eq!(threads.total, 2);
+    assert_eq!(threads.items[0].thread_id, "chat-a");
+    assert_eq!(threads.items[0].thread_title.as_deref(), Some("项目群"));
+    assert_eq!(threads.items[0].message_count, 3);
+    assert_eq!(threads.items[0].last_message.as_deref(), Some("午餐吃什么"));
+    assert_eq!(threads.items[0].last_sender.as_deref(), Some("张三"));
+    assert_eq!(threads.items[1].thread_id, "chat-b");
+    assert_eq!(threads.items[1].message_count, 1);
+    // Empty content falls back to msg_type ("图片").
+    assert_eq!(threads.items[1].last_message.as_deref(), Some("图片"));
+
+    // Keyword filtering applies to threads.
+    let filtered = record_query::chat_threads(
+        &connection,
+        &record_query::ChatThreadsQuery {
+            run_id: "run_chat",
+            record_type: "test.chat",
+            keyword: Some("方案"),
+            filters: &[],
+            bcp_scope: None,
+            skip: 0,
+            limit: 50,
+        },
+    )
+    .expect("filtered");
+    assert_eq!(filtered.total, 1);
+    assert_eq!(filtered.items[0].thread_id, "chat-a");
+    assert_eq!(filtered.items[0].message_count, 1);
+
+    // Schema without ChatLayout returns empty threads.
+    let non_chat = record_query::chat_threads(
+        &connection,
+        &record_query::ChatThreadsQuery {
+            run_id: "run_chat",
+            record_type: "test.user",
+            keyword: None,
+            filters: &[],
+            bcp_scope: None,
+            skip: 0,
+            limit: 50,
+        },
+    )
+    .expect("non-chat");
+    assert_eq!(non_chat.total, 0);
+    assert!(non_chat.items.is_empty());
+}
+
+#[test]
+fn bcp_scope_combines_with_column_filters_and_keyword() {
+    let directory = tempfile::tempdir().expect("case");
+    let bcp_schema = RecordSchema::new("bcp.friends", "好友")
+        .title("{account}")
+        .field(FieldSchema::new("contact_account_type", "应用", FieldKind::Text).key())
+        .field(FieldSchema::new("account", "账号", FieldKind::Text))
+        .field(FieldSchema::new("city", "城市", FieldKind::Text));
+    begin(directory.path(), "run_bcp", "org.test/bcp#");
+    let mut writer =
+        RecordWriter::open(directory.path(), "image", "run_bcp", &[bcp_schema]).expect("writer");
+    let row = |app: &str, acct: &str, city: &str| WireRecord {
+        record_type: "bcp.friends".to_owned(),
+        values: vec![Value::from(app), Value::from(acct), Value::from(city)],
+        title: Some(acct.to_owned()),
+        severity: None,
+        sources: Vec::new(),
+    };
+    writer
+        .insert_batch(&[
+            row("1030001", "acc_a", "Shanghai"),
+            row("1030001", "acc_a", "Beijing"),
+            row("1030001", "acc_b", "Shanghai"),
+            row("1030002", "acc_c", "Shanghai"),
+        ])
+        .expect("insert");
+    drop(writer);
+    publish(
+        directory.path(),
+        "image",
+        "run_bcp",
+        &completion(&ReadFaultReport::default()),
+    )
+    .expect("publish");
+    let connection = record_query::open(directory.path(), "image")
+        .expect("open")
+        .expect("records.db");
+    let scope = crate::core::analysis::results::models::BcpRecordScope {
+        applications: vec!["1030001".to_owned()],
+        account: Some("acc_a".to_owned()),
+    };
+    let filters = [filter("city", &["Shanghai"])];
+    let paged = record_query::records_page(
+        &connection,
+        &RecordsQuery {
+            run_id: "run_bcp",
+            record_type: "bcp.friends",
+            keyword: Some("acc_"),
+            filters: &filters,
+            bcp_scope: Some(&scope),
+            sort: None,
+            descending: false,
+            skip: 0,
+            limit: 50,
+        },
+    )
+    .expect("bcp scoped page");
+    assert_eq!(paged.total, 1);
+    assert_eq!(paged.items[0].values["city"], "Shanghai");
+
+    let facet = record_query::column_values(
+        &connection,
+        &ColumnValuesQuery {
+            run_id: "run_bcp",
+            record_type: "bcp.friends",
+            keyword: Some("acc_"),
+            column: "city",
+            filters: &[],
+            bcp_scope: Some(&scope),
+            limit: 50,
+        },
+    )
+    .expect("bcp scoped facet");
+    assert_eq!(facet.total, 2);
+}

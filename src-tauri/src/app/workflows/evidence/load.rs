@@ -1,0 +1,550 @@
+//! load implementation.
+use super::*;
+use crate::core::common::ids::ImageId;
+use crate::core::evidence::image::EvidenceCache;
+use crate::core::evidence::image::RawReadMode;
+use crate::core::filesystem::evidence_session::EvidenceSession;
+
+struct ImageOpenOptions {
+    qcow_key: Option<qcow2::EncryptionKey>,
+    raw_read_mode: RawReadMode,
+}
+
+/// Map an [`OpenProgress`] to a localized `image-load-progress` event, throttling
+/// intermediate byte updates. Called from the `spawn_blocking` open thread.
+fn emit_load_progress(
+    app: &AppHandle,
+    path: &str,
+    progress: crate::core::evidence::image::OpenProgress,
+    last_emit: &std::sync::Mutex<Option<std::time::Instant>>,
+    tasks: &crate::task_manager::TaskManager,
+    task_id: &str,
+) {
+    use crate::core::evidence::image::OpenProgress;
+    use crate::task_manager::{TaskLabel, TaskStage};
+    let (stage, current, total, is_bytes) = match &progress {
+        OpenProgress::Opening => ("打开镜像".to_string(), 0u64, 0u64, false),
+        OpenProgress::Decompressing { label, done, total } => {
+            (format!("解压 {label}"), *done, *total, true)
+        }
+        OpenProgress::DetectingPartitions => ("检测分区".to_string(), 0, 0, false),
+        OpenProgress::DetectingFilesystems { done, total } => (
+            "检测文件系统".to_string(),
+            *done as u64,
+            *total as u64,
+            false,
+        ),
+    };
+    tasks.update(task_id, |view| {
+        view.stage = Some(match &progress {
+            OpenProgress::Opening => TaskStage::Opening,
+            OpenProgress::Decompressing { .. } => TaskStage::Decompressing,
+            OpenProgress::DetectingPartitions => TaskStage::DetectingPartitions,
+            OpenProgress::DetectingFilesystems { .. } => TaskStage::DetectingFilesystems,
+        });
+        match &progress {
+            OpenProgress::Decompressing { label, .. } => {
+                view.labels.insert(TaskLabel::Item, label.clone());
+            }
+            OpenProgress::Opening
+            | OpenProgress::DetectingPartitions
+            | OpenProgress::DetectingFilesystems { .. } => {
+                view.labels.remove(&TaskLabel::Item);
+            }
+        }
+    });
+    // Phase changes and the final byte update emit immediately; intermediate
+    // byte updates are rate-limited.
+    if is_bytes && current < total {
+        let now = std::time::Instant::now();
+        let Ok(mut last) = last_emit.lock() else {
+            return;
+        };
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < LOAD_PROGRESS_THROTTLE {
+                return;
+            }
+        }
+        *last = Some(now);
+    }
+    tasks.emit_progress(
+        task_id,
+        if is_bytes {
+            crate::task_manager::TaskProgressUnit::Bytes
+        } else {
+            crate::task_manager::TaskProgressUnit::Entries
+        },
+        current,
+        (total > 0).then_some(total),
+        Some(stage.clone()),
+    );
+    if let Err(error) = app.emit(
+        "image-load-progress",
+        ImageLoadProgress {
+            path: path.to_string(),
+            stage,
+            current,
+            total,
+        },
+    ) {
+        tracing::warn!("image load progress delivery failed: {error}");
+    }
+}
+
+pub async fn image_load(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    qcow_key: Option<qcow2::EncryptionKey>,
+    task_id: Option<String>,
+    case_dir: Option<String>,
+    raw_read_mode: RawReadMode,
+) -> Result<ImageInfo, AppError> {
+    let reference_id = uuid::Uuid::parse_str(&path).ok().map(|id| id.to_string());
+    let assembled_reference = path
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("assembled"));
+    let session_hint = if assembled_reference {
+        Some("组装卷引用不在当前进程中或已失效：assembled:// 不是主机文件路径，组装卷只存在于组装它的进程。在同一进程（CLI 的案件后台进程、shell 或 batch）中打开成员检材并重新运行 RAID 检测，使用返回的组装卷。")
+    } else if reference_id.is_some() {
+        Some("image ID not loaded; open its source or load the member images and run RAID detection again")
+    } else if path.starts_with("decrypted://") {
+        Some("decrypted session expired; unlock the source again")
+    } else if path.starts_with(crate::core::evidence::vss_image::SESSION_PREFIX) {
+        Some("shadow copy session expired; open it again from the source image")
+    } else if path.starts_with("offset://") {
+        Some("offset-mounted partition session expired; mount it again from the source image")
+    } else {
+        None
+    };
+    if let Some(hint) = session_hint {
+        if raw_read_mode == RawReadMode::Force || qcow_key.is_some() {
+            return Err(AppError::invalid_input(
+                "RAW mode and QCOW credentials require a regular source path, not a session reference",
+            ));
+        }
+        if let Some(existing) = state
+            .images
+            .lock()
+            .await
+            .values()
+            .find(|image| {
+                reference_id.as_deref() == Some(image.id.as_str())
+                    || image_load_key(&image.path.to_string_lossy()) == image_load_key(&path)
+            })
+            .map(|image| image.info())
+        {
+            return Ok(existing);
+        }
+        if path.starts_with(crate::core::evidence::vss_image::SESSION_PREFIX) {
+            if let Some(info) = try_reopen_vss_or_indexed(&app, &state, &path).await? {
+                return Ok(info);
+            }
+        }
+        let error = AppError::not_found(hint);
+        return Err(if assembled_reference {
+            error.with_context_value(serde_json::json!({
+                "reference": path, "referenceType": "assembled", "requiresLiveSession": true,
+                "recovery": ["case open <案件目录>", "evidence add <成员检材>", "raid detect"]
+            }))
+        } else {
+            error
+        });
+    }
+    let context = state.image_load_context.lock().await;
+    if let Some(expected) = case_dir {
+        let active = state.active_case.lock().await;
+        if !active.as_ref().is_some_and(|case| {
+            image_load_key(&case.dir.to_string_lossy()) == image_load_key(&expected)
+        }) {
+            return Err(AppError::cancelled(
+                "image load cancelled: originating case closed",
+            ));
+        }
+    }
+    let generation = *context;
+    let task = state
+        .tasks
+        .register_if_absent(
+            task_id.unwrap_or_else(|| format!("image-load:{}", uuid::Uuid::new_v4())),
+            crate::task_manager::TaskKind::ImageLoad,
+            None,
+        )
+        .ok_or_else(|| AppError::invalid_input("image load task id already in use"))?;
+    drop(context);
+    task.update(|view| view.subject = vec![path.clone()]);
+    let token = task.token();
+    // Resolve the id only after acquiring the per-path lock. Without this,
+    // concurrent callers (notably case tab restoration + auto-mount) can both
+    // observe a cold path, mint/open the same image independently, and race to
+    // overwrite the runtime entry. The follower now sees the first opener's
+    // registered image and takes the cheap reuse path below.
+    let load_lock = image_load_lock(&state, &path).await;
+    let _load_guard = tokio::select! {
+        guard = load_lock.lock() => guard,
+        () = token.cancelled() => return Err(AppError::cancelled("image load cancelled")),
+    };
+
+    // Reuse the id of an image already loaded from this path so repeated loads
+    // converge on one runtime entry. Failing that, reuse the id this path was
+    // recorded under in the active case's evidence — so re-loading a case's
+    // evidence (or just re-opening the same file across sessions) keeps a
+    // *stable* id. That stability is load-bearing: evidence/snapshot manifest
+    // entries dedup by image_id, and volume snapshots match by (image_id,
+    // volume_key), so a fresh uuid per load would both pile up duplicate
+    // manifest entries and miss every persisted snapshot. Only when neither
+    // knows the path do we mint a new id.
+    let image_id = {
+        let path_key = image_load_key(&path);
+        let by_session = {
+            let images = state.images.lock().await;
+            images
+                .values()
+                .find(|img| image_load_key(&img.path.to_string_lossy()) == path_key)
+                .map(|img| img.id.clone())
+        };
+        match by_session {
+            Some(id) => id,
+            None => {
+                let case = state.active_case.lock().await;
+                case.as_ref()
+                    .and_then(|case| case.evidence_image_id_for_path(&path))
+                    .map_or_else(
+                        || ImageId::new(uuid::Uuid::new_v4().to_string()),
+                        ImageId::from,
+                    )
+            }
+        }
+    };
+    let loaded = load_image_runtime(
+        &state,
+        &app,
+        image_id,
+        path,
+        ImageOpenOptions {
+            qcow_key,
+            raw_read_mode,
+        },
+        &task,
+        generation,
+    )
+    .await;
+    task.finish_with(&loaded);
+    loaded
+}
+
+async fn image_load_lock(state: &AppState, path: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let key = image_load_key(path);
+    let mut locks = state.image_load_locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn image_load_key(path: &str) -> String {
+    crate::core::casework::case::evidence_path_key(path)
+}
+
+async fn load_image_runtime(
+    state: &State<'_, AppState>,
+    app: &AppHandle,
+    image_id: ImageId,
+    path: String,
+    options: ImageOpenOptions,
+    task: &crate::task_manager::TaskRegistration,
+    generation: u64,
+) -> Result<ImageInfo, AppError> {
+    let ImageOpenOptions {
+        qcow_key,
+        raw_read_mode,
+    } = options;
+    let token = task.token();
+    let context = state.image_load_context.lock().await;
+    if token.is_cancelled() || *context != generation {
+        return Err(AppError::cancelled("image load cancelled: case changed"));
+    }
+    if let Some(existing) = {
+        let images = state.images.lock().await;
+        images.get(&image_id).cloned()
+    } {
+        if !existing.is_index_only() && existing.disk_image().raw_read_mode() != raw_read_mode {
+            return Err(AppError::invalid_input(
+                "image already loaded with another RAW read mode; close it before reopening",
+            ));
+        }
+        if existing.is_index_only() {
+            // Retry the real opener: a restored source switches back online,
+            // while a still-missing source revalidates the current case indexes.
+            remove_image_runtime(state, &image_id).await?;
+        } else {
+            // Already loaded this session — still fold it into the active case
+            // (idempotent: evidence registration, fresh snapshots are reused).
+            let info = existing.info();
+            if let Err(error) =
+                crate::app::workflows::snapshot::case_snapshot::register_and_snapshot(
+                    app, state, existing,
+                )
+                .await
+            {
+                remove_image_runtime(state, &info.id).await?;
+                return Err(error);
+            }
+            return Ok(info);
+        }
+    }
+
+    drop(context);
+    // Listings derived from the source (such as the backup projection of a
+    // ZIP) persist in the evidence's case cache, so reopening skips them.
+    let evidence_cache = {
+        let case = state.active_case.lock().await;
+        case.as_ref()
+            .map(|case| crate::core::casework::case_paths::cache_dir(&case.dir, &image_id))
+    };
+    let resource_permit = state.tasks.acquire_resources(task).await?;
+    let progress_tasks = state.tasks.clone();
+    let progress_task_id = task.record().id().to_owned();
+    let worker_token = token.clone();
+    // Partition detection on a real physical drive performs real disk I/O
+    // (probing each partition's filesystem signature). Keep it off the
+    // tokio worker thread so other IPCs stay responsive while it runs.
+    let open_path = path.clone();
+    let open_id = image_id.clone();
+    let progress_app = app.clone();
+    let progress_path = path.clone();
+    let started = std::time::Instant::now();
+    tracing::info!("image_load begin id={image_id} path={path}");
+    let image = tokio::task::spawn_blocking(move || {
+        let _resource_permit = resource_permit;
+        let last_emit = std::sync::Mutex::new(None::<std::time::Instant>);
+        let observer = move |progress: crate::core::evidence::image::OpenProgress| {
+            emit_load_progress(
+                &progress_app,
+                &progress_path,
+                progress,
+                &last_emit,
+                &progress_tasks,
+                &progress_task_id,
+            );
+        };
+        let cache = match evidence_cache.as_deref() {
+            Some(directory) => EvidenceCache::Directory(directory),
+            None => EvidenceCache::Disabled,
+        };
+        if raw_read_mode == RawReadMode::Force {
+            return crate::core::evidence::image::DiskImage::open_forced_raw_cancellable(
+                open_id,
+                std::path::Path::new(&open_path),
+                &observer,
+                &worker_token,
+            );
+        }
+        crate::core::evidence::image::DiskImage::open_cancellable(
+            open_id,
+            &open_path,
+            &observer,
+            qcow_key,
+            cache,
+            &worker_token,
+        )
+    })
+    .await
+    .map_err(|err| AppError::task_panicked("image_load", err))?;
+    // Only publication shares this gate with case transitions; decoding never
+    // holds application locks, so switching cases does not wait for extraction.
+    let context = state.image_load_context.lock().await;
+    if token.is_cancelled() || *context != generation {
+        return Err(AppError::cancelled("image load cancelled: case changed"));
+    }
+    let image = match image {
+        Ok(image) => image,
+        Err(error) => {
+            let missing = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            }) || std::fs::metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if missing || path.starts_with("assembled://") {
+                if let Some(indexed) =
+                    super::indexed::open_indexed_evidence(state, &image_id, &path).await?
+                {
+                    return Ok(indexed.info());
+                }
+            }
+            return Err(AppError::from(error));
+        }
+    };
+    let info = image.info();
+    tracing::info!(
+        "image_load opened id={} format={:?} size={} partitions={} elapsed={:.3?}",
+        info.id,
+        info.source_format,
+        info.size_bytes,
+        info.partitions.len(),
+        started.elapsed()
+    );
+    let arc_image = Arc::new(EvidenceSession::from(image));
+    let mut images = state.images.lock().await;
+    images.insert(arc_image.id.clone(), Arc::clone(&arc_image));
+    drop(images);
+    // If a case is open, register this image as evidence and auto-build a
+    // volume snapshot for each browsable volume (background, cancellable).
+    // Caseless loads build the equivalent session snapshot. Both NTFS paths
+    // scan the complete MFT (including deleted records), so do not also launch
+    // `prefetch_ntfs_deleted_snapshots` here: that used to parse the entire MFT
+    // a second time and competed with the snapshot for the same image cache.
+    // A locked encrypted volume is snapshot the same way once it is unlocked
+    // in place (snapshot_unlocked_volume).
+    if let Err(error) = crate::app::workflows::snapshot::case_snapshot::register_and_snapshot(
+        app,
+        state,
+        Arc::clone(&arc_image),
+    )
+    .await
+    {
+        remove_image_runtime(state, &info.id).await?;
+        return Err(error);
+    }
+    Ok(info)
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
+/// Registers a reconstructed Volume Shadow Copy `DiskImage` into `state.images` (adopting
+/// any case-recorded `image_id` for `snapshot.path`), then triggers `register_and_snapshot` so
+/// active cases record the shadow copy and build snapshots/indexes for plugins and timeline.
+pub(crate) async fn publish_shadow_copy(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    mut snapshot: crate::core::evidence::image::DiskImage,
+    source_check: Option<(&str, &Arc<EvidenceSession>)>,
+) -> Result<ImageInfo, AppError> {
+    let snapshot_path = snapshot.path.to_string_lossy().into_owned();
+    let adopted_id = {
+        let active = state.active_case.lock().await;
+        active
+            .as_ref()
+            .and_then(|case| case.evidence_image_id_for_path(&snapshot_path))
+    };
+
+    let arc_snapshot = {
+        let mut images = state.images.lock().await;
+        if let Some((source_id, source_arc)) = source_check {
+            if !images
+                .get(source_id)
+                .is_some_and(|current| Arc::ptr_eq(current, source_arc))
+            {
+                return Err(AppError::source_changed(
+                    "source image was unloaded while opening the shadow copy",
+                ));
+            }
+        }
+        if let Some(open) = images.values().find(|image| image.path == snapshot.path) {
+            return Ok(open.info());
+        }
+        if let Some(stable_id) = adopted_id {
+            let stable_id = ImageId::new(stable_id);
+            if !images.contains_key(stable_id.as_ref()) {
+                snapshot.id = stable_id;
+            }
+        }
+        let arc_snapshot = Arc::new(EvidenceSession::from(snapshot));
+        images.insert(arc_snapshot.id.clone(), Arc::clone(&arc_snapshot));
+        arc_snapshot
+    };
+
+    let info = arc_snapshot.info();
+    if let Err(error) = crate::app::workflows::snapshot::case_snapshot::register_and_snapshot(
+        app,
+        state,
+        Arc::clone(&arc_snapshot),
+    )
+    .await
+    {
+        let _ = remove_image_runtime(state, &info.id).await;
+        return Err(error);
+    }
+    Ok(info)
+}
+
+/// Attempts to reopen a `vss://<parent_id>/<partition_id>/<store_id>/...` path from a loaded
+/// parent image, or falls back to the active case's offline indexed evidence if present.
+async fn try_reopen_vss_or_indexed(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    path: &str,
+) -> Result<Option<ImageInfo>, AppError> {
+    let rest = path.strip_prefix(crate::core::evidence::vss_image::SESSION_PREFIX);
+    let mut segments = rest.unwrap_or("").split('/');
+    let parent_id = segments.next().unwrap_or("");
+    let part_id = segments.next().and_then(|s| s.parse::<u8>().ok());
+    let store_id = segments.next().unwrap_or("");
+
+    if !parent_id.is_empty() && !store_id.is_empty() {
+        if let Some(partition_id) = part_id {
+            let parent = state.images.lock().await.get(parent_id).cloned();
+            if let Some(parent_session) = parent {
+                if !parent_session.is_index_only() {
+                    let parent_disk = parent_session.disk_image().clone();
+                    let target_store = store_id.to_string();
+                    let reopen_res = tokio::task::spawn_blocking(move || {
+                        let vols = crate::core::evidence::vss_image::list(&parent_disk);
+                        let copy_idx = vols
+                            .into_iter()
+                            .find(|v| v.partition_id == partition_id)
+                            .and_then(|v| {
+                                v.shadow_copies
+                                    .into_iter()
+                                    .find(|c| c.store_id.eq_ignore_ascii_case(&target_store))
+                                    .map(|c| c.index)
+                            });
+                        match copy_idx {
+                            Some(index) => crate::core::evidence::vss_image::open(
+                                &parent_disk,
+                                partition_id,
+                                index,
+                                &tokio_util::sync::CancellationToken::new(),
+                            )
+                            .map(Some),
+                            None => Ok(None),
+                        }
+                    })
+                    .await
+                    .map_err(|err| AppError::task_panicked("vss reopen", err))?;
+
+                    if let Ok(Some(mut snapshot)) = reopen_res {
+                        snapshot.path = std::path::PathBuf::from(path);
+                        let info = publish_shadow_copy(
+                            app,
+                            state,
+                            snapshot,
+                            Some((parent_id, &parent_session)),
+                        )
+                        .await?;
+                        return Ok(Some(info));
+                    }
+                }
+            }
+        }
+    }
+
+    let recorded_id = {
+        let active = state.active_case.lock().await;
+        active
+            .as_ref()
+            .and_then(|case| case.evidence_image_id_for_path(path))
+    };
+    if let Some(id) = recorded_id {
+        if let Some(indexed) = super::indexed::open_indexed_evidence(state, &id, path).await? {
+            return Ok(Some(indexed.info()));
+        }
+    }
+    Ok(None)
+}

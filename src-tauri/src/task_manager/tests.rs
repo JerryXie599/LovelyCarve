@@ -1,0 +1,699 @@
+//! Task lifecycle, cancellation and resource regressions.
+
+use super::*;
+
+#[test]
+fn case_exit_cancels_queued_and_running_loads_without_an_image_identity() {
+    let manager = TaskManager::default();
+    let first = manager.register("load-a", TaskKind::ImageLoad, None);
+    let second = manager.register("load-b", TaskKind::ImageLoad, None);
+    let unrelated = manager.register("export", TaskKind::ImageExport, Some("disk".into()));
+    assert_eq!(manager.cancel_kind(TaskKind::ImageLoad), 2);
+    assert!(first.token().is_cancelled());
+    assert!(second.token().is_cancelled());
+    assert!(!unrelated.token().is_cancelled());
+}
+use std::time::Duration;
+
+#[test]
+fn dropping_registration_removes_task() {
+    let manager = TaskManager::default();
+    let registration = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    assert!(manager.contains("hash-1"));
+    assert_eq!(registration.record().status(), TaskStatus::Queued);
+
+    drop(registration);
+
+    assert!(!manager.contains("hash-1"));
+}
+
+#[test]
+fn repeated_registration_is_reference_counted() {
+    let manager = TaskManager::default();
+    let first = manager.register("snapshot-1", TaskKind::VolumeSnapshot, None);
+    let second = manager.register("snapshot-1", TaskKind::VolumeSnapshot, None);
+    assert_eq!(first.token().is_cancelled(), second.token().is_cancelled());
+
+    drop(first);
+    assert!(manager.contains("snapshot-1"));
+    drop(second);
+    assert!(!manager.contains("snapshot-1"));
+}
+
+#[test]
+fn register_if_absent_rejects_duplicate() {
+    let manager = TaskManager::default();
+    let Some(first) = manager.register_if_absent("snapshot-1", TaskKind::VolumeSnapshot, None)
+    else {
+        panic!("first registration should succeed");
+    };
+
+    assert!(manager
+        .register_if_absent("snapshot-1", TaskKind::VolumeSnapshot, None)
+        .is_none());
+    drop(first);
+    assert!(manager
+        .register_if_absent("snapshot-1", TaskKind::VolumeSnapshot, None)
+        .is_some());
+}
+
+#[test]
+fn cancellation_does_not_let_old_guard_remove_reused_id() {
+    let manager = TaskManager::default();
+    let old = manager.register("export-1", TaskKind::ImageExport, None);
+    let old_token = old.token();
+    assert!(manager.cancel("export-1"));
+    assert!(old_token.is_cancelled());
+
+    let replacement = manager.register("export-1", TaskKind::ImageExport, None);
+    drop(old);
+
+    assert!(manager.contains("export-1"));
+    assert!(!replacement.token().is_cancelled());
+}
+
+#[test]
+fn cancel_image_only_cancels_owned_tasks() {
+    let manager = TaskManager::default();
+    let image_one_hash = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let image_one_snapshot = manager.register(
+        "snapshot-1",
+        TaskKind::SessionSnapshot,
+        Some("image-1".into()),
+    );
+    let image_two_hash = manager.register("hash-2", TaskKind::ImageHash, Some("image-2".into()));
+
+    assert_eq!(manager.cancel_image("image-1"), 2);
+    assert!(image_one_hash.token().is_cancelled());
+    assert!(image_one_snapshot.token().is_cancelled());
+    assert!(!image_two_hash.token().is_cancelled());
+    assert!(manager.contains("hash-2"));
+}
+
+#[tokio::test]
+async fn waiting_for_an_image_returns_once_its_cancelled_tasks_stop() {
+    let manager = TaskManager::default();
+    let hash = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let other = manager.register("hash-2", TaskKind::ImageHash, Some("image-2".into()));
+    assert_eq!(manager.cancel_image("image-1"), 1);
+    let worker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(hash);
+    });
+
+    let holding = manager
+        .wait_image_stopped("image-1", Duration::from_secs(10))
+        .await;
+    // The stopped task is already in the history, so forgetting the image
+    // right after the wait leaves none of its entries behind.
+    let finished_before_forget = manager.finished().len();
+    manager.forget_image("image-1");
+
+    assert_eq!(
+        (holding, finished_before_forget, manager.finished().len()),
+        (Vec::<String>::new(), 1, 0)
+    );
+    assert!(manager.contains("hash-2"));
+    worker.join().expect("worker");
+    drop(other);
+}
+
+#[tokio::test]
+async fn waiting_for_an_image_gives_up_on_tasks_that_hold_on() {
+    let manager = TaskManager::default();
+    let stuck = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    manager.cancel_image("image-1");
+
+    let holding = manager
+        .wait_image_stopped("image-1", Duration::from_millis(50))
+        .await;
+
+    assert_eq!(holding, ["hash-1"]);
+    drop(stuck);
+    assert_eq!(
+        manager
+            .wait_image_stopped("image-1", Duration::from_millis(50))
+            .await,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn cancel_image_kind_preserves_other_work() {
+    let manager = TaskManager::default();
+    let snapshot = manager.register(
+        "snapshot-1",
+        TaskKind::SessionSnapshot,
+        Some("image-1".into()),
+    );
+    let export = manager.register("export-1", TaskKind::ImageExport, Some("image-1".into()));
+
+    assert_eq!(
+        manager.cancel_image_kind("image-1", TaskKind::SessionSnapshot),
+        1
+    );
+    assert!(snapshot.token().is_cancelled());
+    assert!(!export.token().is_cancelled());
+    assert!(manager.contains("export-1"));
+}
+
+#[test]
+fn status_and_list_return_active_task_snapshots() {
+    let manager = TaskManager::default();
+    let first = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let _second = manager.register("scan-1", TaskKind::BitlockerScan, None);
+
+    let Some(status) = manager.status("hash-1") else {
+        panic!("hash-1 should be visible");
+    };
+    assert_eq!(status.id, "hash-1");
+    assert_eq!(status.kind, TaskKind::ImageHash);
+    assert_eq!(status.image_id.as_deref(), Some("image-1"));
+    assert_eq!(status.status, TaskStatus::Queued);
+    assert_eq!(
+        status.resource_classes,
+        vec![
+            TaskResourceClass::GlobalBackground,
+            TaskResourceClass::ImageSequentialIo,
+        ]
+    );
+
+    let tasks = manager.list();
+    assert_eq!(tasks.len(), 2);
+
+    drop(first);
+    assert!(manager.status("missing").is_none());
+}
+
+#[test]
+fn lifecycle_sink_observes_queued_and_finished() {
+    let manager = TaskManager::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    manager.set_event_sink(move |event| {
+        sink_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    });
+
+    let registration = manager.register(
+        "snapshot-1",
+        TaskKind::VolumeSnapshot,
+        Some("image-1".into()),
+    );
+    drop(registration);
+
+    let events = events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].phase, TaskLifecyclePhase::Queued);
+    assert_eq!(events[0].task.id, "snapshot-1");
+    assert_eq!(events[0].task.status, TaskStatus::Queued);
+    assert_eq!(events[1].phase, TaskLifecyclePhase::Finished);
+    assert_eq!(events[1].task.id, "snapshot-1");
+}
+
+#[test]
+fn lifecycle_sink_observes_cancellation_requested() {
+    let manager = TaskManager::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    manager.set_event_sink(move |event| {
+        sink_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    });
+
+    let registration = manager.register("hash-1", TaskKind::ImageHash, None);
+    assert!(manager.cancel("hash-1"));
+    drop(registration);
+
+    let events = events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].phase, TaskLifecyclePhase::Queued);
+    assert_eq!(events[1].phase, TaskLifecyclePhase::CancellationRequested);
+    assert_eq!(events[1].task.status, TaskStatus::CancellationRequested);
+    // A cancelled task still ends when its worker lets go.
+    assert_eq!(events[2].phase, TaskLifecyclePhase::Finished);
+    assert_eq!(events[2].task.outcome, Some(TaskOutcome::Cancelled));
+}
+
+/// A failure the way commands report one.
+struct Failure {
+    cancelled: bool,
+}
+
+impl TaskFailure for Failure {
+    fn is_cancellation(&self) -> bool {
+        self.cancelled
+    }
+
+    fn describe(&self) -> String {
+        "disk unreadable".to_owned()
+    }
+}
+
+#[test]
+fn ended_session_tasks_stay_listed_with_their_view_and_outcome() {
+    let manager = TaskManager::default();
+    let hash = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    hash.update(|view| {
+        view.subject = vec!["MD5".to_owned()];
+        view.counts.insert(TaskCount::SyntheticBytes, 512);
+    });
+    assert!(manager.emit_progress("hash-1", TaskProgressUnit::Bytes, 64, Some(64), None));
+    hash.finish_with(&Ok::<(), Failure>(()));
+    // The first report stands.
+    hash.finish(TaskOutcome::Interrupted);
+    drop(hash);
+
+    let finished = manager.finished();
+    assert_eq!(finished.len(), 1);
+    let task = &finished[0];
+    assert_eq!(task.outcome, Some(TaskOutcome::Succeeded));
+    assert!(task.finished_at_ms.is_some());
+    assert_eq!(
+        task.view,
+        TaskView {
+            subject: vec!["MD5".to_owned()],
+            progress: Some(TaskAmount {
+                unit: TaskProgressUnit::Bytes,
+                done: 64,
+                total: Some(64),
+            }),
+            counts: [(TaskCount::SyntheticBytes, 512)].into(),
+            ..TaskView::default()
+        }
+    );
+    assert!(manager.list().is_empty());
+}
+
+#[test]
+fn unreported_endings_read_as_cancelled_or_interrupted() {
+    let manager = TaskManager::default();
+    let failed = manager.register("export-1", TaskKind::ImageExport, Some("image".into()));
+    failed.finish_with(&Err::<(), _>(Failure { cancelled: false }));
+    drop(failed);
+    let cancelled = manager.register("export-2", TaskKind::ImageExport, Some("image".into()));
+    cancelled.finish_with(&Err::<(), _>(Failure { cancelled: true }));
+    drop(cancelled);
+    let stopped = manager.register("export-3", TaskKind::ImageExport, Some("image".into()));
+    manager.cancel("export-3");
+    drop(stopped);
+    let crashed = manager.register("export-4", TaskKind::ImageExport, Some("image".into()));
+    drop(crashed);
+
+    assert_eq!(
+        manager
+            .finished()
+            .into_iter()
+            .map(|task| (task.id, task.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "export-1".to_owned(),
+                Some(TaskOutcome::Failed {
+                    error: "disk unreadable".to_owned()
+                })
+            ),
+            ("export-2".to_owned(), Some(TaskOutcome::Cancelled)),
+            ("export-3".to_owned(), Some(TaskOutcome::Cancelled)),
+            ("export-4".to_owned(), Some(TaskOutcome::Interrupted)),
+        ]
+    );
+}
+
+#[test]
+fn only_session_listed_kinds_are_kept_after_they_end() {
+    let manager = TaskManager::default();
+    drop(manager.register("flat", TaskKind::FlatList, Some("image".into())));
+    drop(manager.register("search", TaskKind::GlobalSearch, Some("image".into())));
+    drop(manager.register("load", TaskKind::ImageLoad, None));
+    assert_eq!(
+        manager
+            .finished()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>(),
+        vec!["load".to_owned()]
+    );
+}
+
+#[test]
+fn ended_tasks_go_with_their_evidence_or_the_case() {
+    let manager = TaskManager::default();
+    drop(manager.register("hash-a", TaskKind::ImageHash, Some("a".into())));
+    drop(manager.register("hash-b", TaskKind::ImageHash, Some("b".into())));
+    drop(manager.register("load-1", TaskKind::ImageLoad, None));
+    let late_load = manager.register("load-2", TaskKind::ImageLoad, None);
+
+    manager.forget_image("a");
+    manager.forget_unowned();
+    // A load of the previous case that ends now is not kept.
+    drop(late_load);
+
+    assert_eq!(
+        manager
+            .finished()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>(),
+        vec!["hash-b".to_owned()]
+    );
+}
+
+#[test]
+fn a_new_task_under_an_ended_id_replaces_it() {
+    let manager = TaskManager::default();
+    drop(manager.register("autodetect:a", TaskKind::AutoDetect, Some("a".into())));
+    assert_eq!(manager.finished().len(), 1);
+    let again = manager.register("autodetect:a", TaskKind::AutoDetect, Some("a".into()));
+    again.set_automatic();
+    assert!(manager.finished().is_empty());
+    assert!(manager.list()[0].automatic);
+}
+
+#[test]
+fn cancelled_tasks_stay_listed_until_they_stop() {
+    let manager = TaskManager::default();
+    let snapshot = manager.register("snapshot-1", TaskKind::VolumeSnapshot, Some("a".into()));
+    assert!(manager.cancel("snapshot-1"));
+    assert!(!manager.contains("snapshot-1"));
+    let live = manager.list();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].status, TaskStatus::CancellationRequested);
+    // The stopping task still takes reports by id.
+    assert!(manager.update("snapshot-1", |view| {
+        view.stage = Some(TaskStage::Index);
+    }));
+    drop(snapshot);
+    assert!(manager.list().is_empty());
+    let finished = manager.finished();
+    assert_eq!(finished[0].view.stage, Some(TaskStage::Index));
+    assert_eq!(finished[0].outcome, Some(TaskOutcome::Cancelled));
+    assert!(!manager.update("snapshot-1", |_| {}));
+}
+
+#[test]
+fn progress_sink_observes_active_task_snapshot() {
+    let manager = TaskManager::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    manager.set_progress_sink(move |event| {
+        sink_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    });
+
+    let registration = manager.register("hash-1", TaskKind::ImageHash, None);
+
+    assert!(manager.emit_progress(
+        "hash-1",
+        TaskProgressUnit::Bytes,
+        16,
+        Some(64),
+        Some("chunk".to_string()),
+    ));
+    assert!(!manager.emit_progress("missing", TaskProgressUnit::Entries, 1, None, None));
+
+    let events = events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].task.id, "hash-1");
+    assert_eq!(events[0].unit, TaskProgressUnit::Bytes);
+    assert_eq!(events[0].done, 16);
+    assert_eq!(events[0].total, Some(64));
+    assert_eq!(events[0].message.as_deref(), Some("chunk"));
+
+    drop(registration);
+}
+
+#[tokio::test]
+async fn acquired_resources_mark_task_running() {
+    let manager = TaskManager::with_resource_limits(1, 1);
+    let task = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+
+    let permit = manager.acquire_resources(&task).await;
+
+    assert!(permit.is_ok());
+    assert_eq!(task.record().status(), TaskStatus::Running);
+}
+
+#[tokio::test]
+async fn lifecycle_sink_observes_running_after_resource_acquire() {
+    let manager = TaskManager::with_resource_limits(1, 1);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    manager.set_event_sink(move |event| {
+        sink_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    });
+
+    let task = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let permit = manager.acquire_resources(&task).await;
+
+    assert!(permit.is_ok());
+    let events = events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].phase, TaskLifecyclePhase::Queued);
+    assert_eq!(events[1].phase, TaskLifecyclePhase::Running);
+    assert_eq!(events[1].task.status, TaskStatus::Running);
+    assert_eq!(
+        events[1].task.resource_classes,
+        vec![
+            TaskResourceClass::GlobalBackground,
+            TaskResourceClass::ImageSequentialIo,
+        ]
+    );
+}
+
+#[test]
+fn resource_classes_describe_task_kind_lanes() {
+    assert_eq!(
+        TaskKind::ImageHash.resource_classes(),
+        vec![
+            TaskResourceClass::GlobalBackground,
+            TaskResourceClass::ImageSequentialIo,
+        ]
+    );
+    assert_eq!(
+        TaskKind::QrScan.resource_classes(),
+        vec![
+            TaskResourceClass::GlobalBackground,
+            TaskResourceClass::ImageRandomIo,
+            TaskResourceClass::Cpu,
+        ]
+    );
+    assert_eq!(
+        TaskKind::GlobalSearch.resource_classes(),
+        vec![
+            TaskResourceClass::GlobalBackground,
+            TaskResourceClass::ImageRandomIo,
+            TaskResourceClass::Cpu,
+        ]
+    );
+
+    // OCR follows the inference component's build: CUDA takes the GPU slot.
+    use lovelycarve_component_abi::inference::OcrExecution;
+    assert_eq!(
+        resources::ocr_resource_classes(Some(OcrExecution::Cuda)),
+        vec![
+            TaskResourceClass::GlobalBackground,
+            TaskResourceClass::ImageRandomIo,
+            TaskResourceClass::Gpu,
+        ]
+    );
+    for execution in [Some(OcrExecution::Cpu), None] {
+        assert_eq!(
+            resources::ocr_resource_classes(execution),
+            vec![
+                TaskResourceClass::GlobalBackground,
+                TaskResourceClass::ImageRandomIo,
+                TaskResourceClass::Cpu,
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn global_background_limit_blocks_excess_tasks() {
+    let manager = TaskManager::with_resource_limits(1, 1);
+    let first = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let first_permit = manager.acquire_resources(&first).await;
+    assert!(first_permit.is_ok());
+
+    let second = manager.register("scan-1", TaskKind::BitlockerScan, Some("image-2".into()));
+    let waiter_manager = manager.clone();
+    let waiter = tokio::spawn(async move { waiter_manager.acquire_resources(&second).await });
+    tokio::task::yield_now().await;
+
+    assert!(!waiter.is_finished());
+    drop(first_permit);
+
+    let second_permit = waiter
+        .await
+        .map_err(|err| format!("waiter task crashed: {err}"));
+    assert!(matches!(second_permit, Ok(Ok(_))));
+}
+
+#[tokio::test]
+async fn cpu_limit_blocks_excess_cpu_tasks() {
+    let manager = TaskManager::with_all_resource_limits(2, 1, 2, 1, 1);
+    let first = manager.register("scan-1", TaskKind::BitlockerScan, None);
+    let first_permit = manager.acquire_resources(&first).await;
+    assert!(first_permit.is_ok());
+
+    let second = manager.register("scan-2", TaskKind::BitlockerScan, None);
+    let waiter_manager = manager.clone();
+    let waiter = tokio::spawn(async move { waiter_manager.acquire_resources(&second).await });
+    tokio::task::yield_now().await;
+
+    assert!(!waiter.is_finished());
+    drop(first_permit);
+
+    let second_permit = waiter
+        .await
+        .map_err(|err| format!("waiter task crashed: {err}"));
+    assert!(matches!(second_permit, Ok(Ok(_))));
+}
+
+#[tokio::test]
+async fn same_image_sequential_io_is_serial() {
+    let manager = TaskManager::with_resource_limits(2, 1);
+    let first = manager.register("export-1", TaskKind::ImageExport, Some("image-1".into()));
+    let first_permit = manager.acquire_resources(&first).await;
+    assert!(first_permit.is_ok());
+
+    let second = manager.register("export-2", TaskKind::ImageExport, Some("image-1".into()));
+    let waiter_manager = manager.clone();
+    let waiter = tokio::spawn(async move { waiter_manager.acquire_resources(&second).await });
+    tokio::task::yield_now().await;
+
+    assert!(!waiter.is_finished());
+    drop(first_permit);
+
+    let second_permit = waiter
+        .await
+        .map_err(|err| format!("waiter task crashed: {err}"));
+    assert!(matches!(second_permit, Ok(Ok(_))));
+}
+
+#[tokio::test]
+async fn same_image_random_io_has_independent_limit() {
+    let manager = TaskManager::with_all_resource_limits(3, 1, 2, 2, 1);
+    let first = manager.register("flat-1", TaskKind::FlatList, Some("image-1".into()));
+    let second = manager.register("flat-2", TaskKind::FlatList, Some("image-1".into()));
+    let third = manager.register("flat-3", TaskKind::FlatList, Some("image-1".into()));
+
+    let first_permit = manager.acquire_resources(&first).await;
+    let second_permit = manager.acquire_resources(&second).await;
+    assert!(first_permit.is_ok());
+    assert!(second_permit.is_ok());
+
+    let waiter_manager = manager.clone();
+    let waiter = tokio::spawn(async move { waiter_manager.acquire_resources(&third).await });
+    tokio::task::yield_now().await;
+
+    assert!(!waiter.is_finished());
+    drop(first_permit);
+
+    let third_permit = waiter
+        .await
+        .map_err(|err| format!("waiter task crashed: {err}"));
+    assert!(matches!(third_permit, Ok(Ok(_))));
+}
+
+#[tokio::test]
+async fn different_images_can_acquire_until_global_limit() {
+    let manager = TaskManager::with_resource_limits(2, 1);
+    let first = manager.register("export-1", TaskKind::ImageExport, Some("image-1".into()));
+    let second = manager.register("export-2", TaskKind::ImageExport, Some("image-2".into()));
+
+    let first_permit = manager.acquire_resources(&first).await;
+    let second_permit = manager.acquire_resources(&second).await;
+
+    assert!(first_permit.is_ok());
+    assert!(second_permit.is_ok());
+}
+
+#[tokio::test]
+async fn waiting_resource_acquisition_observes_cancellation() {
+    let manager = TaskManager::with_resource_limits(1, 1);
+    let first = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let first_permit = manager.acquire_resources(&first).await;
+    assert!(first_permit.is_ok());
+
+    let second = manager.register("hash-2", TaskKind::ImageHash, Some("image-2".into()));
+    let second_token = second.token();
+    let waiter_manager = manager.clone();
+    let waiter = tokio::spawn(async move { waiter_manager.acquire_resources(&second).await });
+    tokio::task::yield_now().await;
+
+    assert!(!waiter.is_finished());
+    second_token.cancel();
+
+    let result = waiter
+        .await
+        .map_err(|err| format!("waiter task crashed: {err}"));
+    assert!(matches!(result, Ok(Err(_))));
+    drop(first_permit);
+}
+
+#[tokio::test]
+async fn unbudgeted_tasks_run_while_background_permits_are_taken() {
+    let manager = TaskManager::with_resource_limits(1, 1);
+    let hash = manager.register("hash-1", TaskKind::ImageHash, Some("image-1".into()));
+    let hash_permit = manager.acquire_resources(&hash).await;
+    assert!(hash_permit.is_ok());
+
+    let detect = manager.register(
+        "autodetect:image-1",
+        TaskKind::AutoDetect,
+        Some("image-1".into()),
+    );
+    let detect_permit =
+        tokio::time::timeout(Duration::from_secs(5), manager.acquire_resources(&detect)).await;
+
+    assert!(matches!(detect_permit, Ok(Ok(_))));
+    assert_eq!(detect.record().status(), TaskStatus::Running);
+    assert!(TaskKind::AutoDetect.resource_classes().is_empty());
+}
+
+#[tokio::test]
+async fn permit_drop_wakes_waiting_task() {
+    let manager = TaskManager::with_resource_limits(1, 1);
+    let first = manager.register(
+        "snapshot-1",
+        TaskKind::VolumeSnapshot,
+        Some("image-1".into()),
+    );
+    let first_permit = manager.acquire_resources(&first).await;
+    assert!(first_permit.is_ok());
+
+    let second = manager.register(
+        "snapshot-2",
+        TaskKind::VolumeSnapshot,
+        Some("image-2".into()),
+    );
+    let waiter_manager = manager.clone();
+    let waiter = tokio::spawn(async move { waiter_manager.acquire_resources(&second).await });
+    tokio::task::yield_now().await;
+
+    drop(first_permit);
+
+    let second_permit = waiter
+        .await
+        .map_err(|err| format!("waiter task crashed: {err}"));
+    assert!(matches!(second_permit, Ok(Ok(_))));
+}

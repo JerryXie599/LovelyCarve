@@ -1,0 +1,233 @@
+//! 分析结果浏览 IPC:结果树、分页表格、单条详情与运行审计。
+//! 节点名与列定义来自插件声明;旧案件的结果只读展示。
+
+use crate::core::common::ids::ImageId;
+use crate::host::State;
+
+use crate::{
+    app::{error::AppError, workflows::casework::active_case_dir},
+    core::analysis::results::{
+        analysis_query::{
+            self, AnalysisChatThreadsQuery, AnalysisColumnValuesQuery, AnalysisRecordsQuery,
+            AnalysisTreeEvidence,
+        },
+        models::{
+            AnalysisRecordDetail, AnalysisRecordsPage, AnalysisTreeNode, BcpRecordScope,
+            ChatThreadsPage,
+        },
+        record_query::{ColumnFilter, ColumnValues, RunAudit},
+    },
+    core::casework::case::EvidenceRef,
+    state::AppState,
+};
+
+/// 分析结果树:检材 → 分类 → 分析器运行 → 记录类型。未打开案件返回空树。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn analysis_result_tree(
+    state: State<'_, AppState>,
+) -> Result<Vec<AnalysisTreeNode>, AppError> {
+    let (case_dir, evidence) = {
+        let guard = state.active_case.lock().await;
+        match guard.as_ref() {
+            Some(case) => (Some(case.dir.clone()), case.evidence_refs()),
+            None => (None, Vec::new()),
+        }
+    };
+    let Some(case_dir) = case_dir else {
+        return Ok(Vec::new());
+    };
+    let evidence = evidence
+        .into_iter()
+        .map(|evidence| {
+            let label = evidence_label(&evidence);
+            AnalysisTreeEvidence {
+                image_id: evidence.image_id,
+                label,
+            }
+        })
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || analysis_query::analysis_tree(&case_dir, &evidence))
+        .await
+        .map_err(|error| AppError::task_panicked("analysis_result_tree", error))?
+        .map_err(AppError::from)
+}
+
+/// 按选中节点的 runId 分页读取一种记录,翻页期间不切换运行。
+#[cfg_attr(feature = "desktop", tauri::command)]
+#[allow(clippy::too_many_arguments)] // Flat IPC fields also generate the CLI options.
+pub async fn analysis_records_page(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    run_id: String,
+    record_type: String,
+    legacy: Option<bool>,
+    keyword: Option<String>,
+    filters: Option<Vec<String>>,
+    bcp_scope: Option<BcpRecordScope>,
+    sort: Option<String>,
+    descending: Option<bool>,
+    skip: i64,
+    limit: i64,
+) -> Result<AnalysisRecordsPage, AppError> {
+    let case_dir = active_case_dir(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        let query = AnalysisRecordsQuery {
+            image_id: &image_id,
+            run_id: &run_id,
+            record_type: &record_type,
+            legacy: legacy.unwrap_or(false),
+            keyword: keyword.as_deref(),
+            filters: parse_filters(filters),
+            bcp_scope: bcp_scope.as_ref(),
+            sort: sort.as_deref(),
+            descending: descending.unwrap_or(false),
+            skip,
+            limit,
+        };
+        analysis_query::records_page(&case_dir, &query)
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("analysis_records_page", error))?
+    .map_err(AppError::from)
+}
+
+/// 一列的去重值与计数(筛选清单的选项),按当前关键词与其它列的筛选计算。
+#[cfg_attr(feature = "desktop", tauri::command)]
+#[allow(clippy::too_many_arguments)]
+pub async fn analysis_record_values(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    run_id: String,
+    record_type: String,
+    legacy: Option<bool>,
+    keyword: Option<String>,
+    column: String,
+    filters: Option<Vec<String>>,
+    bcp_scope: Option<BcpRecordScope>,
+    limit: Option<i64>,
+) -> Result<ColumnValues, AppError> {
+    let case_dir = active_case_dir(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        let query = AnalysisColumnValuesQuery {
+            image_id: &image_id,
+            run_id: &run_id,
+            record_type: &record_type,
+            legacy: legacy.unwrap_or(false),
+            keyword: keyword.as_deref(),
+            column: &column,
+            filters: parse_filters(filters),
+            bcp_scope: bcp_scope.as_ref(),
+            limit: limit.unwrap_or(DEFAULT_FACET_LIMIT),
+        };
+        analysis_query::column_values(&case_dir, &query)
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("analysis_record_values", error))?
+    .map_err(AppError::from)
+}
+
+/// 按聊天布局汇总会话列表（最近一条消息及时间倒序）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+#[allow(clippy::too_many_arguments)]
+pub async fn analysis_chat_threads(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    run_id: String,
+    record_type: String,
+    legacy: Option<bool>,
+    keyword: Option<String>,
+    filters: Option<Vec<String>>,
+    bcp_scope: Option<BcpRecordScope>,
+    skip: Option<i64>,
+    limit: Option<i64>,
+) -> Result<ChatThreadsPage, AppError> {
+    let case_dir = active_case_dir(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        let query = AnalysisChatThreadsQuery {
+            image_id: &image_id,
+            run_id: &run_id,
+            record_type: &record_type,
+            legacy: legacy.unwrap_or(false),
+            keyword: keyword.as_deref(),
+            filters: parse_filters(filters),
+            bcp_scope: bcp_scope.as_ref(),
+            skip: skip.unwrap_or(0),
+            limit: limit.unwrap_or(DEFAULT_FACET_LIMIT),
+        };
+        analysis_query::chat_threads(&case_dir, &query)
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("analysis_chat_threads", error))?
+    .map_err(AppError::from)
+}
+
+/// The facet's default cap: high enough for real enum-like columns, low
+/// enough to keep the checklist light.
+pub(crate) const DEFAULT_FACET_LIMIT: i64 = 200;
+
+/// Flat IPC entries `列id=值` (value may contain `=`; empty value = 空单元格)
+/// → per-column filters, same column's entries merged in first-seen order.
+fn parse_filters(filters: Option<Vec<String>>) -> Vec<ColumnFilter> {
+    let mut ordered: Vec<ColumnFilter> = Vec::new();
+    for entry in filters.unwrap_or_default() {
+        let Some((column, value)) = entry.split_once('=') else {
+            continue;
+        };
+        if column.is_empty() {
+            continue;
+        }
+        match ordered.iter_mut().find(|filter| filter.column == column) {
+            Some(filter) => {
+                if !filter.values.iter().any(|item| item == value) {
+                    filter.values.push(value.to_owned());
+                }
+            }
+            None => ordered.push(ColumnFilter {
+                column: column.to_owned(),
+                values: vec![value.to_owned()],
+            }),
+        }
+    }
+    ordered
+}
+
+/// 单条记录详情(表格行 → 右侧预览),带它所属类型的列。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn analysis_record_detail(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    record_id: String,
+) -> Result<Option<AnalysisRecordDetail>, AppError> {
+    let case_dir = active_case_dir(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        analysis_query::record_detail(&case_dir, &image_id, &record_id)
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("analysis_record_detail", error))?
+    .map_err(AppError::from)
+}
+
+/// 一次运行的审计:目标、输入、选项、画像事实、告警与合成字节。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn analysis_run_get(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    run_id: String,
+) -> Result<Option<RunAudit>, AppError> {
+    let case_dir = active_case_dir(&state).await?;
+    tokio::task::spawn_blocking(move || analysis_query::run_audit(&case_dir, &image_id, &run_id))
+        .await
+        .map_err(|error| AppError::task_panicked("analysis_run_get", error))?
+        .map_err(AppError::from)
+}
+
+/// 检材节点展示名:镜像文件名(与案件管理列表一致)。
+fn evidence_label(evidence: &EvidenceRef) -> String {
+    evidence
+        .path
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(&evidence.path)
+        .to_owned()
+}

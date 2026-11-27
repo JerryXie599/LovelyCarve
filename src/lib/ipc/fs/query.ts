@@ -1,0 +1,102 @@
+import { invokeCmd } from '../client';
+import { type DockerIndexStatus, type FsNode, type FlatFileFilter, type FlatSortColumn, type Page, type FsLocateResult, type FsFlatPage } from './types';
+import type { ImageId, NodeId } from '../ids';
+
+
+/** Prepare only this container; success includes its persisted directory index. */
+export function fsDockerPrepare(args: { imageId: ImageId; rootId: string; caseDir: string | null; mode: 'status' | 'build' }): Promise<DockerIndexStatus> {
+  return invokeCmd('fs_docker_prepare', args);
+}
+
+export function fsChildren(args: { imageId: ImageId; parentId: NodeId | null }): Promise<FsNode[]> {
+  return invokeCmd<FsNode[]>('fs_children', args);
+}
+
+/** Cursor-paged directory listing. The first page uses `cursor: null`;
+ *  subsequent pages pass the returned `nextCursor`. Results are sorted by
+ *  stable `(name, id)` keys, so huge single directories can be consumed
+ *  without one large IPC response. The legacy `fsChildren` remains available
+ *  for existing full-directory callers. */
+export function fsChildrenPage(args: {
+  imageId: ImageId;
+  parentId: NodeId | null;
+  cursor?: string | null;
+  pageSize?: number | null;
+  /** Backend filter / sort (`core::catalog::directory_query::DirectoryQuery`);
+   *  `hideEmptyDirs` leaves out directories whose whole subtree holds no file
+   *  (ignored at the image root; directories no snapshot can judge stay). */
+  query?: { filter?: FlatFileFilter; sort?: FlatSortColumn | null; descending?: boolean; hideEmptyDirs?: boolean };
+}): Promise<Page<FsNode>> {
+  return invokeCmd<Page<FsNode>>('fs_children_page', args);
+}
+
+/** 把一个节点解析为可导航的祖先帧链（全局搜索跳转定位）。文件走案件
+ *  filedb 的 pid 链；分区/未分配/磁盘间隙虚拟节点按 id 前缀合成。 */
+export function fsNodeLocate(args: {
+  imageId: ImageId;
+  nodeId: NodeId;
+}): Promise<FsLocateResult> {
+  return invokeCmd<FsLocateResult>('fs_node_locate', args);
+}
+
+/** Resolve plugin provenance directly in its evidence volume, without filedb. */
+export function fsSourceLocate(args: { imageId: ImageId; rootId: string; path: string }): Promise<FsLocateResult> {
+  return invokeCmd<FsLocateResult>('fs_source_locate', args);
+}
+
+/** plist 结构化预览：bplist00 / XML plist 解析为 JSON 树（后端解析，前端
+ * 拿 JSON 文本喂结构化查看器）。 */
+export function fsPlistPreview(args: { imageId: ImageId; nodeId: NodeId }): Promise<{
+  format: string;
+  json: string | null;
+  truncated: boolean;
+  error: string | null;
+}> {
+  return invokeCmd('fs_plist_preview', args);
+}
+
+/** 文件全显的一页。与逐级浏览(`fsChildren`)的差别只有一个布尔:前端叫
+ *  `deepsearch`,后端叫 `allowAllFiles`;起点 `parentId` 仍传当前节点,置位
+ *  后语义从「列一层」变成「以该节点为根递归平铺文件」。`skip`/`limit` 分页,
+ *  `keyword` 命中名称或路径,`sort`/`sortdesc` 服务端排序,`filter` 是列漏斗
+ *  的表达式过滤;`refresh` 让后端丢掉该起点的实时遍历缓存重走。 */
+export function fsFlatPage(args: {
+  imageId: ImageId;
+  parentId: NodeId;
+  deepsearch: boolean;
+  keyword?: string | null;
+  sort?: FlatSortColumn | null;
+  sortdesc?: boolean;
+  skip: number;
+  limit: number;
+  filter?: FlatFileFilter;
+  refresh?: boolean;
+}): Promise<FsFlatPage> {
+  const { deepsearch, ...rest } = args;
+  return invokeCmd<FsFlatPage>('fs_flat_page', { ...rest, allowAllFiles: deepsearch });
+}
+
+/** Batch directory child-counts served from the active case's volume snapshot.
+ *  Returns a map of `parentId → count` containing ONLY the ids a snapshot
+ *  covers; uncovered ids (no case, still building, truncated) are omitted, so
+ *  the caller falls back to a bounded live probe just for those. Replaces the
+ *  per-subdir `fsChildren` count fan-out whenever a snapshot exists. */
+export function fsChildCounts(
+  args: { imageId: ImageId; parentIds: string[] },
+): Promise<Record<string, number>> {
+  return invokeCmd<Record<string, number>>('fs_child_counts', args);
+}
+
+/** Batch "is this directory's subtree empty of files?" served from the volume
+ *  snapshot. Returns a map of `parentId → isEmpty` for ONLY the ids a snapshot
+ *  can decide: `true` = the subtree holds nothing but (recursively) empty
+ *  directories, `false` = a real file exists somewhere beneath it. Uncovered
+ *  ids (no case, still building, truncated) are omitted, so the caller falls
+ *  back to its direct child-count signal for those. Drives the directory tree's
+ *  "hide empty directories" filter, which hides a dir when its whole subtree is
+ *  file-less (not just when it is directly empty). */
+export function fsSubtreeEmptyDirs(
+  args: { imageId: ImageId; parentIds: string[] },
+): Promise<Record<string, boolean>> {
+  return invokeCmd<Record<string, boolean>>('fs_subtree_empty_dirs', args);
+}

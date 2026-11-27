@@ -1,0 +1,43 @@
+# 文档导航
+
+功能概览、截图、获取方式与快速开始见根目录的 [README](../README.md)。本目录的文档按读者分为三类；构建命令以根目录 `justfile` 为准，命令注册以 `src-tauri/src/lib.rs` 为准。
+
+## 使用
+
+| 文档 | 内容 |
+| --- | --- |
+| [使用指南](USAGE.md) | 案件与检材、镜像信息、文件浏览与预览、校验与导出、全局搜索、时间线、文件恢复、插件分析、BCP 数据与只读挂载 |
+| [CLI 手册](CLI.md) | 独立的 `lovelycarve-cli`：地址、案件与后台进程、输出与退出码、浏览与查找、加密卷、RAID、文件恢复、插件、时间线、交互 shell、批量请求与 `rpc`，以及编码代理技能 |
+| [Python 读取库](../python/README.md) | PyO3 `lovelycarve`：只读打开镜像、分区与目录浏览、文件属性、范围读取和 seekable 文件对象 |
+| [iOS 备份](IOS_BACKUPS.md) | iTunes / Finder 本地备份的浏览、加密备份解锁与异常检查 |
+| [Linux 基本信息插件](LINUXINFO.md) | 内置 `linuxinfo` 插件的分析范围、构建部署与验证 |
+
+## 格式与读取器
+
+[格式总览与维护要求](formats/README.md) 汇总读取器的通用约束，并按格式列出各专题的要点。专题按类别如下：
+
+| 类别 | 专题 |
+| --- | --- |
+| 文件系统 | [NTFS](formats/NTFS.md) · [ext2/3/4](formats/EXT.md) · [FAT / exFAT](formats/FAT.md) · [XFS](formats/XFS.md) · [ReFS](formats/REFS.md) · [APFS](formats/APFS.md) · [传统 HFS](formats/CLASSIC_HFS.md) · [HFS+ / HFSX](formats/HFS.md) · [ISO 9660 与光盘 BIN / CUE](formats/CDFS.md) · [UDF](formats/UDF.md) · [CramFS / ROMFS](formats/ROM_IMAGES.md) · [Minix FS](formats/MINIX.md) · [JFS](formats/JFS.md) · [ReiserFS](formats/REISERFS.md) · [Amiga OFS / FFS](formats/AMIGA.md) · [BeFS](formats/BEFS.md) · [GFS2](formats/GFS2.md) · [OCFS2](formats/OCFS2.md) · [NILFS2](formats/NILFS2.md) · [bcachefs](formats/BCACHEFS.md) · [MINIFS](formats/MINIFS.md) · [F2FS](formats/F2FS.md) · [EROFS](formats/EROFS.md) · [QNX4 / QNX6](formats/QNX.md) · [SquashFS](formats/SQUASHFS.md) · [JFFS2](formats/JFFS2.md) · [YAFFS1](formats/YAFFS1.md) · [YAFFS2](formats/YAFFS2.md) · [UBIFS](formats/UBIFS.md) |
+| 分区、卷与阵列 | [GPT](formats/GPT.md) · [MBR / EBR](formats/MBR.md) · [LVM2](formats/LVM.md) · [Linux md RAID](formats/MDRAID.md) · [固件 RAID](formats/FIRMWARE_RAID.md) |
+| 加密与快照 | [LUKS](formats/LUKS.md) · [VeraCrypt](formats/VERACRYPT.md) · [BitLocker](formats/BITLOCKER.md) · [FileVault 2](formats/FILEVAULT.md) · [卷影副本](formats/VSS.md) |
+| 镜像容器与固件 | [RAW / 分段 RAW](formats/SMRAW.md) · [EWF](formats/EWF.md) · [VMDK](formats/VMDK.md) · [VHD / VHDX](formats/VHD.md) · [QCOW / QCOW2](formats/QCOW.md) · [Parallels PHDI](formats/PHDI.md) · [UBI / 小米 HDR1 固件](formats/UBI.md) · [路由器固件](formats/FIRMWARE.md) · [固件兼容性调查](formats/FIRMWARE_COMPATIBILITY.md) |
+| 压缩与备份 | [GZIP](formats/GZIP.md) · [Android 备份](formats/ANDROID_BACKUP.md) · [小米备份](formats/MIUI_BAK.md) · [iOS 备份](IOS_BACKUPS.md) |
+| 文件内容 | [KeePass KDBX](formats/KDBX.md) |
+
+vendored 读取器的上游版本与本地补丁记录在 [vendor/UPSTREAM.md](../src-tauri/vendor/UPSTREAM.md)，后端探针程序见 [examples/README.md](../src-tauri/examples/README.md)。
+
+## 开发
+
+| 任务 | 文档 |
+| --- | --- |
+| 配置环境、构建、打包与性能验证 | [开发指南](DEVELOPMENT.md) |
+| 提交修改、选择验证范围、整理与合并 PR | [贡献指南](../CONTRIBUTING.md)、[PR 规范](../CONTRIBUTING.md#拉取请求)、[仓库约定](../AGENTS.md) |
+| 理解后端、证据会话、任务、案件存储与索引 | [架构说明](ARCHITECTURE.md) |
+| 修改界面与前端状态 | [前端规范](FRONTEND.md)、[前端模块与生命周期](FRONTEND_STRUCTURE.md) |
+| 增加命令或事件 | [架构说明 · 功能与 IPC 对照](ARCHITECTURE.md#功能与-ipc-对照)、[扩展流程](ARCHITECTURE.md#扩展流程) |
+| 开发插件 | [LPP 协议与 SDK](PLUGIN_PROTOCOL.md) |
+| 发布版本 | [发布指南](RELEASING.md)、[第三方声明](../THIRD_PARTY_NOTICES.md) |
+| 报告安全问题 | [安全策略](../SECURITY.md) |
+
+新增或修改功能时同步更新所属文档：用户可见的变化写入 [CHANGELOG](../CHANGELOG.md) 的 `[Unreleased]`，格式能力写入对应的格式专题。测试样本的来源、许可与哈希保存在样本目录，第三方许可证与来源说明随代码保留。

@@ -1,0 +1,133 @@
+name: Windows release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Windows x64
+    if: github.repository == 'LovelyTeams/LovelyCarve'
+    runs-on: windows-2025
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Check tag and manifest versions
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $rustVersion = [regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $pythonVersion = [regex]::Match((Get-Content python/pyproject.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $pythonRustVersion = [regex]::Match((Get-Content python/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $componentVersion = [regex]::Match((Get-Content src-tauri/components/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$' -or $tag.Split('-')[0] -ne "v$version" -or $version -ne $tauriVersion -or $version -ne $rustVersion -or $version -ne $pythonVersion -or $version -ne $pythonRustVersion -or $version -ne $componentVersion) {
+            throw "Tag $tag does not match manifest versions: $version / $tauriVersion / $rustVersion / $pythonVersion / $pythonRustVersion / $componentVersion"
+          }
+      - uses: ./.github/actions/setup-windows
+      - name: Build desktop MSI
+        run: just build-release --bundles msi
+      - name: Build and package CLI
+        run: just pack-cli
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.11.28'
+      - name: Build Python wheel
+        env:
+          LOVELYCARVE_PYTHON: '3.10'
+        run: |
+          $env:OPENSSL_LIB = Join-Path $env:OPENSSL_DIR 'lib/VC/x64/MD'
+          just build-python
+      - name: Stage assets and SHA-256 checksums
+        run: |
+          $installers = @(Get-ChildItem src-tauri/target/release/bundle/msi/*.msi -File)
+          $cliPackages = @(Get-ChildItem dist-pack/lovelycarve-cli-*.zip -File)
+          $version = $env:GITHUB_REF_NAME.Split('-')[0].Substring(1)
+          $wheels = @(Get-ChildItem "dist-pack/python/lovelycarve-$version-*-win_amd64.whl" -File)
+          if (-not $installers.Count -or -not $cliPackages.Count -or $wheels.Count -ne 1) {
+            throw 'Expected an MSI, CLI ZIP and one matching Windows x64 Python wheel'
+          }
+          $assets = $installers + $cliPackages + $wheels
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          $assets | Copy-Item -Destination release-assets
+          Get-ChildItem release-assets -File | Sort-Object Name | ForEach-Object {
+            $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+            "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content release-assets/SHA256SUMS.txt -Encoding utf8NoBOM
+          @"
+          Windows x64 build of $env:GITHUB_SHA. QR/OCR is disabled. Binaries are unsigned.
+
+          Includes the desktop MSI, standalone CLI ZIP, Python wheel for CPython 3.10+ and SHA-256 checksums.
+          Download the wheel and install it with ``python -m pip install <wheel file>``.
+          See the [changelog](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_REF_NAME/CHANGELOG.md) for release changes.
+          Dokany mounts require a separately installed driver. Native GUI and driver checks remain manual.
+
+          Source checkout (GitHub source archives do not include the pinned plugin submodule):
+          ``git clone --recurse-submodules https://github.com/$env:GITHUB_REPOSITORY.git``
+          ``git checkout $env:GITHUB_REF_NAME``
+          ``git submodule update --init --recursive``
+          "@ | Set-Content release-notes.md -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-x64-${{ github.ref_name }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Stage wheel for PyPI
+        if: github.repository == 'LovelyTeams/LovelyCarve' && !contains(github.ref_name, '-')
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pypi-wheel
+          path: release-assets/*.whl
+          if-no-files-found: error
+          retention-days: 7
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $arguments = @('release', 'create', $env:GITHUB_REF_NAME, '--verify-tag', '--title', "LovelyCarve $env:GITHUB_REF_NAME (Windows x64)", '--notes-file', 'release-notes.md')
+          if ($env:GITHUB_REF_NAME.Contains('-')) { $arguments += '--prerelease' }
+          $arguments += @(Get-ChildItem release-assets -File | ForEach-Object FullName)
+          gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed' }
+
+  publish-pypi:
+    name: Publish Python wheel to PyPI
+    if: github.repository == 'LovelyTeams/LovelyCarve' && !contains(github.ref_name, '-')
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pypi-wheel
+          path: dist
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.11.28'
+          enable-cache: false
+      - name: Upload wheel
+        run: uv publish --no-config --trusted-publishing always --check-url https://pypi.org/simple/ dist/*.whl

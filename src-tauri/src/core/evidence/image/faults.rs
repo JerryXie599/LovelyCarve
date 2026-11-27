@@ -1,0 +1,269 @@
+//! faults implementation.
+use super::*;
+use std::mem::DropGuard;
+
+/// A span of the image that could not be read and was zero-filled instead of
+/// aborting the operation. Surfaced for diagnostics; offsets are absolute
+/// image bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BadRegion {
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Behaviour requested by an evidentiary operation when a source read must be
+/// synthesized. Interactive browsing remains tolerant; hash and export IPCs
+/// accept this policy explicitly so a caller can require fail-closed output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadFaultPolicy {
+    Strict,
+    #[default]
+    ZeroFillAndReport,
+}
+
+/// Structured audit payload returned by hash/export commands and the
+/// `image_bad_regions` query. Regions are normalized, sorted, and coalesced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadFaultReport {
+    pub bad_regions: Vec<BadRegion>,
+    pub synthetic_bytes: u64,
+    pub read_faults_detected: bool,
+}
+
+impl ReadFaultReport {
+    pub fn from_regions(regions: Vec<BadRegion>) -> Self {
+        let bad_regions = normalize_bad_regions(regions);
+        let synthetic_bytes = bad_regions
+            .iter()
+            .fold(0u64, |total, region| total.saturating_add(region.len));
+        Self {
+            read_faults_detected: !bad_regions.is_empty(),
+            bad_regions,
+            synthetic_bytes,
+        }
+    }
+}
+
+thread_local! {
+    pub(super) static READ_FAULT_COLLECTIONS: RefCell<Vec<Vec<BadRegion>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `operation` with a fault collector of its own on this thread and
+/// reports what it collected. A panicking operation still removes its
+/// collector, so an outer scope never receives the inner one's faults.
+pub(super) fn collect_in_scope<T>(operation: impl FnOnce() -> T) -> (T, ReadFaultReport) {
+    READ_FAULT_COLLECTIONS.with(|collections| collections.borrow_mut().push(Vec::new()));
+    let unwind = DropGuard::new((), |()| {
+        READ_FAULT_COLLECTIONS.with(|collections| {
+            collections.borrow_mut().pop();
+        });
+    });
+    let output = operation();
+    DropGuard::dismiss(unwind);
+    let regions = READ_FAULT_COLLECTIONS
+        .with(|collections| collections.borrow_mut().pop().unwrap_or_default());
+    (output, ReadFaultReport::from_regions(regions))
+}
+
+pub(super) fn collect_read_fault_intersections(
+    regions: &[BadRegion],
+    offset: u64,
+    len: u64,
+) -> Vec<BadRegion> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let end = offset.saturating_add(len);
+    regions
+        .iter()
+        .filter_map(|region| {
+            let region_end = region.offset.saturating_add(region.len);
+            let intersection_start = region.offset.max(offset);
+            let intersection_end = region_end.min(end);
+            (intersection_end > intersection_start).then_some(BadRegion {
+                offset: intersection_start,
+                len: intersection_end.saturating_sub(intersection_start),
+            })
+        })
+        .collect()
+}
+
+/// `regions` of a read of `len` bytes at `from`, clipped to that read and moved
+/// to the address space in which the same bytes start at `to`. Composite
+/// devices report a member's synthesized spans at their own offsets this way.
+pub fn rebase_bad_regions(regions: &[BadRegion], from: u64, len: u64, to: u64) -> Vec<BadRegion> {
+    collect_read_fault_intersections(regions, from, len)
+        .into_iter()
+        .map(|region| BadRegion {
+            offset: to.saturating_add(region.offset - from),
+            len: region.len,
+        })
+        .collect()
+}
+
+pub(super) fn record_collected_read_faults(regions: Vec<BadRegion>) {
+    if regions.is_empty() {
+        return;
+    }
+    READ_FAULT_COLLECTIONS.with(|collections| {
+        if let Some(current) = collections.borrow_mut().last_mut() {
+            current.extend(regions);
+        }
+    });
+}
+
+pub(super) fn normalize_bad_regions(mut regions: Vec<BadRegion>) -> Vec<BadRegion> {
+    regions.retain(|region| region.len > 0);
+    regions.sort_by_key(|region| region.offset);
+    let mut normalized: Vec<BadRegion> = Vec::with_capacity(regions.len());
+    for region in regions {
+        if let Some(last) = normalized.last_mut() {
+            let last_end = last.offset.saturating_add(last.len);
+            let region_end = region.offset.saturating_add(region.len);
+            if region.offset <= last_end {
+                last.len = last_end.max(region_end).saturating_sub(last.offset);
+                continue;
+            }
+        }
+        normalized.push(region);
+    }
+    normalized
+}
+
+/// Sector-sized granularity for skipping past an unreadable span. A single bad
+/// 512-byte sector shouldn't poison the surrounding kilobytes.
+pub(super) const FAULT_GRANULARITY: usize = 512;
+
+/// Fills `buf` from `read_at`, tolerating bad sectors. Failed requests are
+/// bisected at absolute [`FAULT_GRANULARITY`] sector boundaries until only
+/// an unreadable sector (or the requested part of it) remains. Only that span
+/// is zero-filled and logged; successful spans are accepted in full. Backends
+/// may modify the buffer before returning an error, so every failed span must
+/// be retried or explicitly zeroed. Gaps are zeroed explicitly
+/// because bulk [`DiskImage::read_into`] calls pass the caller's reused
+/// hash / export buffer straight through; skipping would leave stale bytes
+/// from the previous chunk where the report claims zeros.
+/// Returns the number of bytes filled (including zero-filled gaps; a trailing
+/// real EOF stops the fill early so the caller can truncate) together with the
+/// absolute-offset spans that were fabricated as zeros. The caller records
+/// those spans so the fabrication stays forensically auditable rather than
+/// living only in a transient log line — a re-read served from the block cache
+/// would otherwise return the synthetic zeros indistinguishably from real data.
+pub(super) fn tolerant_fill<F>(
+    start: u64,
+    buf: &mut [u8],
+    mut read_at: F,
+) -> (usize, Vec<BadRegion>)
+where
+    F: FnMut(u64, &mut [u8]) -> anyhow::Result<usize>,
+{
+    let mut filled = 0usize;
+    let mut end = buf.len();
+    // Visit the left half first, then resume the deferred right halves. The
+    // stack is O(log(sectors)); even an entirely unreadable request takes at
+    // most 2 * sectors - 1 calls and O(bytes * log(sectors)) requested bytes,
+    // rather than retrying the whole remaining suffix for every bad sector.
+    let mut pending_ends = Vec::new();
+    let mut faults: Vec<BadRegion> = Vec::new();
+    let mut first_error = None;
+    while filled < buf.len() {
+        let offset = start + filled as u64;
+        match read_at(offset, &mut buf[filled..end]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) => {
+                let within_sector = (offset % FAULT_GRANULARITY as u64) as usize;
+                let sectors = (within_sector + end - filled).div_ceil(FAULT_GRANULARITY);
+                if sectors > 1 {
+                    pending_ends.push(end);
+                    end = filled + (sectors / 2) * FAULT_GRANULARITY - within_sector;
+                    continue;
+                }
+                let skip = end - filled;
+                if first_error.is_none() {
+                    first_error = Some(err.to_string());
+                }
+                // Coalesce a run of adjacent bad sectors into one span.
+                match faults.last_mut() {
+                    Some(last) if last.offset + last.len == offset => last.len += skip as u64,
+                    _ => faults.push(BadRegion {
+                        offset,
+                        len: skip as u64,
+                    }),
+                }
+                buf[filled..filled + skip].fill(0);
+                filled += skip;
+            }
+        }
+        if filled == end {
+            end = pending_ends.pop().unwrap_or(buf.len());
+        }
+    }
+    if let Some(error) = first_error {
+        let synthetic_bytes: u64 = faults.iter().map(|region| region.len).sum();
+        tracing::warn!(
+            start,
+            requested_bytes = buf.len(),
+            synthetic_bytes,
+            regions = faults.len(),
+            "image read faults; zero-filled gaps (first error: {error})"
+        );
+    }
+    (filled, faults)
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bad_sectors_emit_one_summary_without_losing_audit_spans() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut bytes = [0xff; 512 * 385];
+        let (filled, faults) = tracing::subscriber::with_default(subscriber, || {
+            tolerant_fill(0, &mut bytes, |_, _| anyhow::bail!("truncated fixture"))
+        });
+        assert_eq!(filled, bytes.len());
+        assert_eq!(
+            faults,
+            vec![BadRegion {
+                offset: 0,
+                len: bytes.len() as u64
+            }]
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(
+            output.contains("truncated fixture") && output.contains("synthetic_bytes=197120"),
+            "{output}"
+        );
+    }
+}

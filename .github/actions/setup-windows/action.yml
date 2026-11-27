@@ -1,0 +1,56 @@
+name: Windows build prerequisites
+description: Install the manifest toolchains and bootstrap the pinned plugin workspace.
+inputs:
+  rust:
+    description: Install the Rust toolchain and configure OpenSSL
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2.2.0
+      with:
+        bun-version-file: package.json
+    - uses: extractions/setup-just@v4
+    - name: Configure Rust and OpenSSL
+      if: inputs.rust == 'true'
+      shell: pwsh
+      run: |
+        $manifest = Get-Content src-tauri/Cargo.toml -Raw
+        $version = [regex]::Match($manifest, '(?m)^rust-version = "([^"]+)"').Groups[1].Value
+        if (-not $version) { throw 'Missing rust-version in Cargo.toml' }
+        if ($version.Split('.').Count -eq 2) { $version += '.0' }
+        $architecture = 'x64'
+        $opensslCrt = 'MT'
+        if ($env:RUNNER_ARCH -eq 'ARM64') {
+          $version += '-aarch64-pc-windows-msvc'
+          $architecture = 'arm64'
+          # Keep OpenSSL static while matching the CLI's dynamic MSVC runtime.
+          $opensslCrt = 'MD'
+        }
+        rustup toolchain install $version --profile minimal
+        if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+        rustup override set $version
+        if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain selection failed' }
+        $openssl = Join-Path $env:ProgramFiles 'OpenSSL'
+        $libraries = Join-Path $openssl "lib/VC/$architecture/$opensslCrt"
+        foreach ($name in @('libssl_static.lib', 'libcrypto_static.lib')) {
+          $library = Join-Path $libraries $name
+          if (-not (Test-Path -LiteralPath $library -PathType Leaf)) {
+            throw "Missing static OpenSSL library: $library"
+          }
+        }
+        "OPENSSL_DIR=$openssl" >> $env:GITHUB_ENV
+        "OPENSSL_LIB=$libraries" >> $env:GITHUB_ENV
+    - name: Cache dependency downloads
+      uses: actions/cache@v6.1.0
+      with:
+        path: |
+          ~/.bun/install/cache
+          ~/.cargo/registry/cache
+          ~/.cargo/registry/index
+          ~/.cargo/git/db
+        key: windows-dependencies-v2-${{ runner.arch }}-${{ github.job }}-${{ inputs.rust }}-${{ hashFiles('bun.lock', '**/Cargo.lock') }}
+        restore-keys: windows-dependencies-v2-${{ runner.arch }}-${{ github.job }}-${{ inputs.rust }}-
+    - name: Bootstrap
+      shell: pwsh
+      run: just bootstrap

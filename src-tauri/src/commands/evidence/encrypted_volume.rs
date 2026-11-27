@@ -1,0 +1,523 @@
+//! Encrypted volumes: inspect their metadata, find BitLocker keys in memory,
+//! and unlock BitLocker, LUKS, VeraCrypt or FileVault through one command into
+//! the source partition or a separate session image. Source-partition unlock
+//! also starts the existing snapshot/index workflow, whose
+//! `snapshot-build-progress` events report its independent completion.
+
+use crate::core::common::ids::ImageId;
+use crate::host::{AppHandle, State};
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
+
+use crate::core::evidence::crypto::bde_image::{BdeMetadataInfo, BdeVolume, VolumeByteReader};
+use crate::core::evidence::crypto::bde_vmk::{
+    self, BitlockerScanProgress, VmkCandidate, VmkScanCandidate, VmkScanResult,
+};
+use crate::core::evidence::crypto::encrypted_image::{
+    self, EncryptedVolumeInspect, UnlockOptions, UnlockResult, UnlockTarget,
+};
+use crate::core::evidence::image::PartitionKind;
+use crate::state::AppState;
+use crate::task_manager::{TaskKind, TaskLabel, TaskProgressUnit};
+use {
+    crate::app::access::loaded_image_app_error, crate::app::access::reject_if_folder,
+    crate::app::error::AppError,
+};
+
+/// Inspect locked CoreStorage metadata and run the upstream forensic auditor.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn filevault_inspect(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    options: crate::core::evidence::crypto::filevault::InspectOptions,
+    task_id: Option<String>,
+) -> Result<crate::core::evidence::crypto::filevault::Inventory, AppError> {
+    let source = loaded_image_app_error(&state, &image_id).await?;
+    reject_if_folder(&source)?;
+    let task = state
+        .tasks
+        .register_if_absent(
+            task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            TaskKind::FilevaultInspect,
+            Some(image_id.clone()),
+        )
+        .ok_or_else(|| AppError::invalid_input("task id is already in use"))?;
+    let permit = state.tasks.acquire_resources(&task).await?;
+    let token = task.token();
+    let source_for_inspection = Arc::clone(&source);
+    let token_for_inspection = token.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _task = task;
+        crate::core::evidence::crypto::filevault::inspect(
+            &source_for_inspection,
+            options,
+            token_for_inspection,
+        )
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("FileVault inspection", error))?;
+    if token.is_cancelled() {
+        return Err(AppError::cancelled("FileVault 元数据读取已取消"));
+    }
+    if !state
+        .images
+        .lock()
+        .await
+        .get(&image_id)
+        .is_some_and(|current| Arc::ptr_eq(current, &source))
+    {
+        return Err(AppError::source_changed(
+            "FileVault evidence unloaded during inspection",
+        ));
+    }
+    result.map_err(AppError::from)
+}
+
+/// Inspect a BitLocker partition's format, protector kinds and volume
+/// identity without credentials.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn bitlocker_inspect(
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    partition_id: u8,
+) -> Result<BdeMetadataInfo, AppError> {
+    let image = loaded_image_app_error(&state, &image_id).await?;
+    reject_if_folder(&image)?;
+    tokio::task::spawn_blocking(move || {
+        let partition = image
+            .partitions
+            .iter()
+            .find(|partition| partition.id == partition_id)
+            .ok_or_else(|| AppError::not_found("partition not found"))?;
+        if partition.kind != PartitionKind::Bitlocker {
+            return Err(AppError::invalid_input("partition is not BitLocker"));
+        }
+        let offset = partition
+            .start_lba
+            .checked_mul(image.sector_size as u64)
+            .ok_or_else(|| AppError::invalid_input("partition offset overflow"))?;
+        let length = partition
+            .length_lba
+            .checked_mul(image.sector_size as u64)
+            .ok_or_else(|| AppError::invalid_input("partition size overflow"))?;
+        let source: Arc<dyn VolumeByteReader> = image.disk_image().clone();
+        BdeVolume::read_metadata_io(Arc::downgrade(&source), offset, length).map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("bitlocker_inspect", error))?
+}
+
+/// Scan a memory image for BitLocker VMK candidates, each with the recovery
+/// password it derives against the partition; an unlock with a candidate's
+/// VMK goes through `encrypted_volume_unlock`.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn bitlocker_scan_memory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    partition_id: u8,
+    memory_path: String,
+    task_id: String,
+) -> Result<VmkScanResult, AppError> {
+    let image = loaded_image_app_error(&state, &image_id).await?;
+    reject_if_folder(&image)?;
+    let memory_path = PathBuf::from(memory_path);
+
+    // Register a cancellation token so `task_cancel(taskId)` drains the
+    // rayon scan within seconds.
+    let task = state.tasks.register(
+        task_id.clone(),
+        TaskKind::BitlockerScan,
+        Some(image_id.clone()),
+    );
+    let resource_permit = state.tasks.acquire_resources(&task).await?;
+    let token = task.token();
+
+    let task_id_inner = task_id.clone();
+    let app_inner = app.clone();
+    let tasks_inner = state.tasks.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<VmkScanResult, AppError> {
+        let _resource_permit = resource_permit;
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let scan_done = Arc::new(AtomicBool::new(false));
+
+        // Bridge tokio CancellationToken → AtomicBool so `bde_vmk` stays
+        // tokio-agnostic. The watcher exits cleanly when the scan signals
+        // done, regardless of whether cancellation fired.
+        let cancel_for_poll = Arc::clone(&cancel_flag);
+        let scan_done_for_poll = Arc::clone(&scan_done);
+        let watcher = std::thread::spawn(move || {
+            while !scan_done_for_poll.load(Ordering::Relaxed) {
+                if token.is_cancelled() {
+                    cancel_for_poll.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let progress = |done: u64, total: u64| {
+            if let Err(error) = app_inner.emit(
+                "bitlocker-scan-progress",
+                BitlockerScanProgress {
+                    task_id: task_id_inner.clone(),
+                    bytes_done: done,
+                    bytes_total: total,
+                },
+            ) {
+                tracing::debug!("emit bitlocker-scan-progress failed: {error}");
+            }
+            tasks_inner.emit_progress(
+                &task_id_inner,
+                TaskProgressUnit::Bytes,
+                done,
+                Some(total),
+                None,
+            );
+        };
+
+        let raw_outcome =
+            bde_vmk::scan_memory_file_with_progress(&memory_path, &progress, cancel_flag.as_ref());
+
+        scan_done.store(true, Ordering::Relaxed);
+        if watcher.join().is_err() {
+            tracing::warn!("BitLocker memory-scan cancellation watcher panicked");
+        }
+
+        let raw_candidates = raw_outcome.map_err(AppError::from)?;
+
+        let partition = image
+            .partitions
+            .iter()
+            .find(|p| p.id == partition_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("partition not found: {partition_id}")))?;
+        let mut candidates = Vec::with_capacity(raw_candidates.len());
+        for VmkCandidate {
+            offset,
+            type_flag,
+            key_type,
+            vmk_hex,
+        } in raw_candidates
+        {
+            let recovery_key = match ::hex::decode(&vmk_hex) {
+                Ok(vmk) => bde_vmk::recovery_key_from_vmk(&image, &partition, &vmk)
+                    .ok()
+                    .flatten(),
+                Err(_) => None,
+            };
+            candidates.push(VmkScanCandidate {
+                offset,
+                type_flag,
+                key_type,
+                vmk_hex,
+                recovery_key,
+                already_tried: false,
+            });
+        }
+        Ok(VmkScanResult {
+            partition_id,
+            candidates,
+        })
+    })
+    .await
+    .map_err(|err| AppError::task_panicked("bitlocker_scan_memory", err))?
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn encrypted_volume_unlock(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    image_id: ImageId,
+    options: UnlockOptions,
+    task_id: Option<String>,
+) -> Result<UnlockResult, AppError> {
+    let source = loaded_image_app_error(&state, &image_id).await?;
+    if options.node_id.is_none() {
+        reject_if_folder(&source)?;
+    }
+    let target = options.target;
+    let partition_id = options.partition_id;
+    let node_subject = options.node_id.clone();
+    if let Some(id) = partition_id {
+        if target == UnlockTarget::SourcePartition
+            && source
+                .info()
+                .unlocked_partitions
+                .iter()
+                .any(|unlocked| unlocked.id == id)
+        {
+            return Err(AppError::invalid_input("分区已解锁"));
+        }
+    }
+    let task_id = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let progress_task_id = task_id.clone();
+    let task = state
+        .tasks
+        .register_if_absent(
+            task_id,
+            TaskKind::EncryptedVolumeUnlock,
+            Some(image_id.clone()),
+        )
+        .ok_or_else(|| AppError::invalid_input("task id is already in use"))?;
+    task.update(|view| {
+        view.labels
+            .insert(TaskLabel::Scheme, options.scheme.as_str().to_owned());
+        if let Some(nid) = &node_subject {
+            view.subject.push(format!("node:{nid}"));
+        }
+        // The volume, then its label (none: the whole image or container).
+        if let Some(id) = partition_id {
+            view.subject.push(format!("part:{id}"));
+            let label = source
+                .partitions
+                .iter()
+                .find(|partition| partition.id == id)
+                .and_then(|partition| partition.label.clone())
+                .filter(|label| !label.is_empty());
+            view.subject.extend(label);
+        }
+    });
+    let unlocked = async {
+        let permit = state.tasks.acquire_resources(&task).await?;
+        let token = task.token();
+        let source_for_unlock = Arc::clone(&source);
+        let token_for_unlock = token.clone();
+        let tasks = state.tasks.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            // VeraCrypt reports its header search in key derivation jobs.
+            let progress = |done: u64, total: u64| {
+                tasks.emit_progress(
+                    &progress_task_id,
+                    TaskProgressUnit::Attempts,
+                    done,
+                    Some(total),
+                    None,
+                );
+            };
+            encrypted_image::unlock_session_with_progress(
+                &source_for_unlock,
+                options,
+                token_for_unlock,
+                &progress,
+            )
+        })
+        .await
+        .map_err(|error| AppError::task_panicked("encrypted volume unlock", error))?;
+        if token.is_cancelled() {
+            return Err(AppError::cancelled("encrypted volume unlock cancelled"));
+        }
+        let (image, mut result) = result.map_err(AppError::from)?;
+        let mut images = state.images.lock().await;
+        if token.is_cancelled() {
+            return Err(AppError::cancelled("encrypted volume unlock cancelled"));
+        }
+        if !images
+            .get(&image_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &source))
+        {
+            return Err(AppError::source_changed(
+                "encrypted evidence was unloaded during unlock",
+            ));
+        }
+        if target == UnlockTarget::SourcePartition {
+            let partition_id = partition_id
+                .or_else(|| {
+                    source
+                        .partitions
+                        .iter()
+                        .find(|partition| {
+                            partition.start_lba * source.sector_size as u64 == result.source_offset
+                                && partition.length_lba * source.sector_size as u64
+                                    == result.source_length
+                        })
+                        .map(|partition| partition.id)
+                })
+                .or_else(|| {
+                    (source.partitions.is_empty()
+                        && result.source_offset == 0
+                        && result.source_length == source.len())
+                    .then_some(0)
+                })
+                .ok_or_else(|| AppError::invalid_input("请选择源镜像中的完整加密分区"))?;
+            source
+                .attach_decrypted_partition(
+                    partition_id,
+                    image,
+                    result.scheme,
+                    result.read_cancellation.clone(),
+                )
+                .map_err(AppError::from)?;
+            result.image = source.info();
+            result.volume_key = Some(format!("part:{partition_id}"));
+            drop(images);
+            state.flat_walk_cache.lock().purge_image(&image_id);
+            crate::app::workflows::snapshot::case_snapshot::snapshot_unlocked_volume(
+                &app,
+                &state,
+                Arc::clone(&source),
+                format!("part:{partition_id}").into(),
+            )
+            .await;
+        } else {
+            let session =
+                Arc::new(crate::core::filesystem::evidence_session::EvidenceSession::from(image));
+            images.insert(session.id.clone(), Arc::clone(&session));
+            drop(images);
+            register_unlocked_child_image(&app, &state, session).await?;
+        }
+        Ok(result)
+    }
+    .await;
+    if let Ok(unlocked) = &unlocked {
+        task.update(|view| {
+            view.labels
+                .insert(TaskLabel::Cipher, unlocked.cipher.clone());
+        });
+    }
+    task.finish_with(&unlocked);
+    unlocked
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrackResult {
+    pub matched_password: Option<String>,
+    pub unlock: UnlockResult,
+}
+
+/// Inspect container headers (LUKS1/LUKS2 cipher/KDF/slots, FileVault2 LV, VeraCrypt entropy & hidden offset).
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn encrypted_volume_inspect(
+    state: State<'_, AppState>,
+    image_id: crate::core::common::ids::ImageId,
+    node_id: Option<String>,
+    partition_id: Option<u8>,
+    offset: Option<u64>,
+    length: Option<u64>,
+) -> Result<EncryptedVolumeInspect, AppError> {
+    let source = loaded_image_app_error(&state, &image_id).await?;
+    if node_id.is_none() {
+        reject_if_folder(&source)?;
+    }
+    tokio::task::spawn_blocking(move || {
+        encrypted_image::inspect_session(&source, node_id.as_deref(), partition_id, offset, length)
+    })
+    .await
+    .map_err(|error| AppError::task_panicked("encrypted volume inspect", error))?
+    .map_err(AppError::from)
+}
+
+/// Multi-core wordlist unlock that returns the matched password alongside the unlocked volume session.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn encrypted_volume_crack(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    image_id: crate::core::common::ids::ImageId,
+    options: UnlockOptions,
+    task_id: Option<String>,
+) -> Result<CrackResult, AppError> {
+    let source = loaded_image_app_error(&state, &image_id).await?;
+    if options.node_id.is_none() {
+        reject_if_folder(&source)?;
+    }
+    let target = options.target;
+    let partition_id = options.partition_id;
+    let task_id = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let task = state
+        .tasks
+        .register_if_absent(
+            task_id,
+            TaskKind::EncryptedVolumeUnlock,
+            Some(image_id.clone()),
+        )
+        .ok_or_else(|| AppError::invalid_input("task id is already in use"))?;
+    let outcome = async {
+        let permit = state.tasks.acquire_resources(&task).await?;
+        let token = task.token();
+        let src = Arc::clone(&source);
+        let tok = token.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            encrypted_image::unlock_session_and_return_matched_password(&src, options, tok)
+        })
+        .await
+        .map_err(|error| AppError::task_panicked("encrypted volume crack", error))?;
+        if token.is_cancelled() {
+            return Err(AppError::cancelled("encrypted volume crack cancelled"));
+        }
+        let (image, mut result, matched_password) = res.map_err(AppError::from)?;
+        let mut images = state.images.lock().await;
+        if target == UnlockTarget::SourcePartition {
+            let pid = partition_id
+                .or_else(|| {
+                    source
+                        .partitions
+                        .iter()
+                        .find(|p| {
+                            p.start_lba * source.sector_size as u64 == result.source_offset
+                                && p.length_lba * source.sector_size as u64 == result.source_length
+                        })
+                        .map(|p| p.id)
+                })
+                .unwrap_or(0);
+            source
+                .attach_decrypted_partition(
+                    pid,
+                    image,
+                    result.scheme,
+                    result.read_cancellation.clone(),
+                )
+                .map_err(AppError::from)?;
+            result.image = source.info();
+            result.volume_key = Some(format!("part:{pid}"));
+            drop(images);
+            state.flat_walk_cache.lock().purge_image(&image_id);
+            crate::app::workflows::snapshot::case_snapshot::snapshot_unlocked_volume(
+                &app,
+                &state,
+                Arc::clone(&source),
+                crate::core::common::ids::VolumeKey::new(format!("part:{pid}")),
+            )
+            .await;
+        } else {
+            let session =
+                Arc::new(crate::core::filesystem::evidence_session::EvidenceSession::from(image));
+            images.insert(session.id.clone(), Arc::clone(&session));
+            drop(images);
+            register_unlocked_child_image(&app, &state, session).await?;
+        }
+        Ok(CrackResult {
+            matched_password,
+            unlock: result,
+        })
+    }
+    .await;
+    task.finish_with(&outcome);
+    outcome
+}
+
+async fn register_unlocked_child_image(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    session: Arc<crate::core::filesystem::evidence_session::EvidenceSession>,
+) -> Result<(), AppError> {
+    if let Err(error) = crate::app::workflows::snapshot::case_snapshot::register_and_snapshot(
+        app,
+        state,
+        Arc::clone(&session),
+    )
+    .await
+    {
+        state.images.lock().await.remove(&session.id);
+        return Err(error);
+    }
+    Ok(())
+}

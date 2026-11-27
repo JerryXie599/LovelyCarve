@@ -1,0 +1,330 @@
+/* Shared report layout for the structured file viewers (PE / ELF / Mach-O /
+   ar / GGUF): a header with the file's identity badges, one recessed strip of
+   key figures, then flat sections (heading + count + filter, then fields, a
+   list or a table). Sections are separated by spacing, not cards; inside a
+   section only a table or list keeps a hairline frame, so every surface has a
+   single outline. Included per component through `<style scoped src>` (like
+   data-table.css), so the generic class names stay local to each viewer. */
+.report-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 16px;
+  overflow: auto;
+  box-sizing: border-box;
+}
+
+/* Sections keep their natural height; the viewer itself scrolls. */
+.report-viewer > * {
+  flex-shrink: 0;
+}
+
+.dim {
+  color: var(--text-secondary);
+}
+
+.strong {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* ── Header ── */
+.report-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.report-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--primary-soft);
+  color: var(--primary-color);
+}
+
+.report-title {
+  min-width: 0;
+}
+
+.report-name {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.report-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* ── Key figures: one recessed strip with no boxes inside it ── */
+.report-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 12px 16px;
+  margin: 0;
+  padding: 12px 16px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-primary);
+}
+
+.report-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.report-stat dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.report-stat dt {
+  order: 2;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+/* ── Fields ── */
+.report-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px 24px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.report-fields > div {
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.report-fields > div.wide {
+  grid-column: 1 / -1;
+}
+
+.report-fields dt {
+  flex: none;
+  width: 88px;
+  color: var(--text-secondary);
+}
+
+.report-fields dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* ── Section heading + filter ── */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.section-filter {
+  width: min(220px, 45%);
+  height: 28px;
+  margin-left: auto;
+}
+
+.section-filter > input {
+  font-family: var(--font-mono);
+}
+
+/* ── Framed table or list: the one outline inside a section ── */
+.table-scroll {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.framed-list {
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+/* High-entropy code sections: whole row tinted, hinting at packing. */
+.g-table tbody tr.row-flag td {
+  background: var(--sev-critical-bg);
+}
+
+.g-table tr.dim td {
+  color: var(--text-secondary);
+}
+
+.ralign {
+  text-align: right;
+}
+
+.th-entropy {
+  min-width: 120px;
+}
+
+.entropy-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.entropy-bar {
+  display: inline-block;
+  width: 64px;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-tertiary);
+}
+
+.entropy-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  transition: width var(--transition-normal);
+}
+
+.entropy-fill.low {
+  background: var(--primary-color);
+}
+
+.entropy-fill.mid {
+  background: var(--sev-warn-fg);
+}
+
+.entropy-fill.high {
+  background: var(--sev-critical-fg);
+}
+
+/* ── Collapsible groups (imports, segments) ── */
+.disclosure + .disclosure {
+  border-top: 1px solid var(--border-color);
+}
+
+.disclosure > summary {
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 0;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.disclosure > summary .ui-chevron {
+  color: var(--text-secondary);
+}
+
+.disclosure > summary:hover .ui-chevron {
+  color: var(--text-primary);
+}
+
+.disclosure > summary:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
+.func-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 0 0 12px 20px;
+  font-size: 11px;
+}
+
+.func {
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--chip-count-bg);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.empty-row {
+  padding: 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+}
+
+.trunc-note {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+/* ── Parse warnings ── */
+.report-warnings {
+  flex-direction: row;
+}
+
+.warn-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.warn-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.warn-line {
+  margin: 0;
+  font-size: 12px;
+  word-break: break-all;
+}

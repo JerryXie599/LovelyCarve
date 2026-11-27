@@ -1,0 +1,962 @@
+# LovelyCarve development tasks. Run `just` or `just --list` for the catalog.
+# Configuration and prerequisites: docs/DEVELOPMENT.md.
+set windows-shell := ["pwsh", "-NoProfile", "-Command"]
+
+# Override with environment variables or `just name=value <recipe>`.
+# An empty VS_PATH lets vswhere find the latest C++ tools installation.
+vs_path := env_var_or_default("VS_PATH", "")
+openssl_dir := env_var_or_default("OPENSSL_DIR", "C:\\Program Files\\OpenSSL-Win64")
+openssl_lib := env_var_or_default("OPENSSL_LIB", openssl_dir + "\\lib\\VC\\x64\\MT")
+perl_bin := env_var_or_default("PERL_BIN", "")
+opencv_dir := env_var_or_default("OPENCV_DIR", justfile_directory() + "\\opencv-contrib-install")
+opencv_lib := env_var_or_default("OPENCV_LIB", "opencv_world4130")
+opencv_msvc := env_var_or_default("OPENCV_MSVC", "vc18")
+opencv_src := env_var_or_default("OPENCV_SRC", justfile_directory() + "\\opencv\\sources")
+opencv_contrib := env_var_or_default("OPENCV_CONTRIB", justfile_directory() + "\\opencv_contrib-4.x\\opencv_contrib-4.x\\modules")
+opencv_install := env_var_or_default("OPENCV_INSTALL", opencv_dir)
+
+# Dot-source the environment in the same shell as the native command.
+opensslenv := ". '" + justfile_directory() + "\\scripts\\windows-env.ps1' -OpenSSLDir '" + openssl_dir + "' -OpenSSLLib '" + openssl_lib + "' -PerlBin '" + perl_bin + "'"
+windowsenv := opensslenv + " -VisualStudio -VsPath '" + vs_path + "'"
+vsenv := windowsenv + " -OpenCV -OpenCVDir '" + opencv_dir + "' -OpenCVLib '" + opencv_lib + "' -OpenCVMsvc '" + opencv_msvc + "'"
+cargo_env := if os() == "windows" { windowsenv + "; " } else { "" }
+python := if os() == "windows" { "python" } else { "python3" }
+python_version := env_var_or_default("LOVELYCARVE_PYTHON", "3.15")
+# OpenSSL's Windows libcrypto.lib is an import library even inside MT; Python
+# wheels use the static library names so consumers need no OpenSSL DLL on PATH.
+python_openssl_libs := env_var_or_default("OPENSSL_LIBS", "libssl_static:libcrypto_static")
+python_openssl_lib := env_var_or_default("OPENSSL_LIB", openssl_dir + "\\lib\\VC\\x64\\MD")
+python_cargo_env := if os() == "windows" { cargo_env + "$env:OPENSSL_LIB_DIR='" + python_openssl_lib + "'; $env:OPENSSL_LIBS='" + python_openssl_libs + "'; " } else { "" }
+cli_executable := if os() == "windows" { "src-tauri/target/debug/lovelycarve-cli.exe" } else { "src-tauri/target/debug/lovelycarve-cli" }
+
+[private]
+default:
+    @just --list --unsorted
+
+# Initialize the pinned plugin submodule and install frontend dependencies.
+[group("setup")]
+bootstrap:
+    git submodule update --init --recursive
+    bun install --frozen-lockfile
+
+# Run the complete frontend checks required for a contribution, side by side, and report every failure.
+[group("verify")]
+verify-fe:
+    bun run --parallel --no-exit-on-error 'check:*' test build
+
+# Run the backend checks required for a contribution.
+[group("verify")]
+verify-rust: fmt check clippy clippy-components test test-components
+
+# Run the SDK, process host and linuxinfo checks.
+[group("verify")]
+verify-plugins: fmt clippy-plugins test-plugins
+
+# Install the read-only Python package into python/.venv using uv's interpreter.
+[group("python")]
+develop-python:
+    {{ python_cargo_env }}uv sync --project python --python {{ python_version }}
+
+# Build an installable Python wheel (no desktop or QR/OCR features).
+[group("python")]
+build-python:
+    {{ python_cargo_env }}uv build --project python --python {{ python_version }} --wheel --out-dir dist-pack/python
+
+# Verify the installed Python package against synthetic disk and archive fixtures.
+[group("python")]
+test-python: develop-python
+    uv run --project python --no-sync python -m unittest discover -s python/tests -v
+
+# Format only the Python binding's Rust crate.
+[group("python")]
+fmt-python:
+    cargo fmt --manifest-path python/Cargo.toml
+
+# Lint the Python binding without changing the desktop build.
+[group("python")]
+clippy-python *args:
+    {{ python_cargo_env }}cargo clippy --manifest-path python/Cargo.toml {{ args }} -- -D warnings
+
+# Start Vite after preparing offline viewer assets.
+[group("frontend")]
+dev-fe:
+    bun scripts/copy-file-viewer-assets.ts
+    bun run dev
+
+# Type-check the Vue app with vue-tsc, and the Bun scripts and Vite configs with bun check.
+[group("frontend")]
+typecheck:
+    bun run typecheck
+    bun run check:tooling
+
+# Run frontend unit tests.
+[group("frontend")]
+test-fe:
+    bun run test
+
+# Type-check and build the frontend bundle.
+[group("frontend")]
+build-fe:
+    bun run build
+
+# Check the typed frontend IPC boundary.
+[group("frontend")]
+ipc-check:
+    bun run check:ipc
+
+# Check frontend module ownership and explicit cross-feature contracts.
+[group("frontend")]
+frontend-structure-check:
+    bun run check:structure
+
+# Check translations, interpolation parameters and untranslated template text.
+[group("frontend")]
+i18n-check:
+    bun run check:i18n
+
+# Upgrade both viewer packages and refresh offline assets.
+[group("frontend")]
+update-file-viewer version *args:
+    bun update --exact @file-viewer/vue3-full@{{ version }} @file-viewer/vite-plugin@{{ version }} {{ args }}
+    bun scripts/copy-file-viewer-assets.ts
+
+# Refresh frontend dependencies within the reviewed manifest constraints.
+[group("frontend")]
+update-fe:
+    bun update
+    bun scripts/copy-file-viewer-assets.ts
+
+# Format the backend, the component and plugin workspaces and all maintained reader crates.
+[group("backend")]
+fmt:
+    cd src-tauri && cargo fmt
+    cd src-tauri/components && cargo fmt
+    cd plugins && cargo fmt
+    cd src-tauri/vendor/qcow2 && cargo fmt
+    cd src-tauri/vendor/vdi && cargo fmt
+    cd src-tauri/vendor/ewf && cargo fmt
+    cd src-tauri/vendor/ntfs && cargo fmt
+    cd src-tauri/vendor/vmdk && cargo fmt
+    cd src-tauri/vendor/bitlocker && cargo fmt
+    cd src-tauri/vendor/vhd && cargo fmt
+    cd src-tauri/vendor/vhdx && cargo fmt
+    cd src-tauri/vendor/luks && cargo fmt
+    cd src-tauri/vendor/veracrypt && cargo fmt
+    cd src-tauri/vendor/kdbx && cargo fmt
+    cd src-tauri/vendor/vsc && cargo fmt
+    cd src-tauri/vendor/gzipf && cargo fmt
+    cd src-tauri/vendor/smraw && cargo fmt
+    cd src-tauri/vendor/phdi && cargo fmt
+    cd src-tauri/vendor/refs-reader && cargo fmt
+    cd src-tauri/vendor/sqlite-core && cargo fmt
+    cd src-tauri/vendor/ad1 && cargo fmt
+    cd src-tauri/vendor/ios-backup && cargo fmt
+    cd src-tauri/vendor/apfs && cargo fmt
+    cd src-tauri/vendor/hfsplus && cargo fmt
+    cd src-tauri/vendor/filevault && cargo fmt
+    cd src-tauri/vendor/cmpfs && cargo fmt
+    cd src-tauri/vendor/udif && cargo fmt
+    cd src-tauri/vendor/ext4-view && cargo fmt
+    cd src-tauri/vendor/lamfold && cargo fmt
+    cd src-tauri/vendor/lamfold-cramfs && cargo fmt
+    cd src-tauri/vendor/lamfold-romfs && cargo fmt
+    cd src-tauri/vendor/lamfold-udf && cargo fmt
+    cd src-tauri/vendor/minix-reader && cargo fmt
+    cd src-tauri/vendor/classic-hfs && cargo fmt
+    cd src-tauri/vendor/jfs-reader && cargo fmt
+    cd src-tauri/vendor/reiserfs-reader && cargo fmt
+    cd src-tauri/vendor/amiga-reader && cargo fmt
+    cd src-tauri/vendor/befs-reader && cargo fmt
+    cd src-tauri/vendor/gfs2-reader && cargo fmt
+    cd src-tauri/vendor/ocfs2-reader && cargo fmt
+    cd src-tauri/vendor/nilfs2-reader && cargo fmt
+    cd src-tauri/vendor/bcachefs-reader && cargo fmt
+    cd src-tauri/vendor/rust-fs-bcachefs && cargo fmt
+    cd src-tauri/vendor/rust-fs-core && cargo fmt
+    cd src-tauri/vendor/amiga-ffs && cargo fmt
+    cd src-tauri/vendor/amiga-rdb && cargo fmt
+    cd src-tauri/vendor/lamfold-erofs && cargo fmt
+    cd src-tauri/vendor/f2fs-reader && cargo fmt
+    cd src-tauri/vendor/qnx-reader && cargo fmt
+    cd src-tauri/vendor/minifs && cargo fmt
+    cd src-tauri/vendor/backhand && cargo fmt
+    cd src-tauri/vendor/lzma-rs && cargo fmt
+    cd src-tauri/vendor/sercomm-firmware && cargo fmt
+    cd src-tauri/vendor/ubidump && cargo fmt
+    cd src-tauri/vendor/jffs2 && cargo fmt
+    cd src-tauri/vendor/yaffs2-reader && cargo fmt
+    cd src-tauri/vendor/rsqlite-vfs && cargo fmt
+    cd src-tauri/vendor/rufs && cargo fmt
+    cd src-tauri/vendor/xfs-fuse && cargo fmt
+    cd src-tauri/vendor/fatfs && cargo fmt
+    cd src-tauri/vendor/exfat && cargo fmt
+    cd src-tauri/vendor/gpt && cargo fmt
+    cd src-tauri/vendor/notatin && cargo fmt
+    cd src-tauri/vendor/magika && cargo fmt
+
+# Refresh backend and component dependencies within the reviewed manifest constraints.
+[group("backend")]
+update-rust:
+    cargo update --manifest-path src-tauri/Cargo.toml
+    cargo update --manifest-path src-tauri/components/Cargo.toml
+
+# Compile-check the standalone CLI backend and the desktop build, without QR/OCR.
+[group("backend")]
+[working-directory("src-tauri")]
+check *args:
+    {{ cargo_env }}cargo check --no-default-features {{ args }}
+    {{ cargo_env }}cargo check --no-default-features --features desktop {{ args }}
+
+# Lint the standalone CLI backend and the desktop build, without QR/OCR.
+[group("backend")]
+[working-directory("src-tauri")]
+clippy:
+    {{ cargo_env }}cargo clippy --no-default-features
+    {{ cargo_env }}cargo clippy --no-default-features --features desktop
+
+# Run backend tests; optionally pass a test filter and Cargo arguments.
+[group("backend")]
+[working-directory("src-tauri")]
+test *args:
+    {{ cargo_env }}cargo test --no-default-features {{ args }}
+
+# Build the native components (the inference DLL) beside the backend executables; pass --release or --features ocr / ocr-cuda.
+[group("backend")]
+[working-directory("src-tauri/components")]
+build-components *args:
+    {{ cargo_env }}cargo build --locked {{ args }}
+
+# Test the component ABI and the inference component without OCR; optionally pass a test filter and Cargo arguments.
+[group("backend")]
+[working-directory("src-tauri/components")]
+test-components *args:
+    {{ cargo_env }}cargo test --locked --workspace {{ args }}
+
+# Lint the component workspace without OCR.
+[group("backend")]
+[working-directory("src-tauri/components")]
+clippy-components:
+    {{ cargo_env }}cargo clippy --locked --workspace --all-targets
+
+# Build lc-plugin-host and stage every plugin package (library and schema.json); pass --release for bundles.
+[group("plugins")]
+build-plugins *args:
+    {{ cargo_env }}bun scripts/build-plugins.ts {{ args }}
+
+# Package every workspace plugin as an installable .lcpkg.
+[group("plugins")]
+[windows]
+pack-plugins: (build-plugins "--release")
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack-plugins.ps1'
+
+# Write the plugin market index.json for the .lcpkg files of a directory (default dist-pack).
+[group("plugins")]
+[windows]
+[working-directory("src-tauri")]
+market-index directory="dist-pack" title="LovelyCarve":
+    {{ cargo_env }}cargo run --no-default-features --bin lovelycarve-cli -- plugin market index ([IO.Path]::GetFullPath('{{ directory }}', '{{ justfile_directory() }}')) --title '{{ title }}'
+
+# Test the SDK, lc-plugin-host and the plugins.
+[group("plugins")]
+test-plugins *args:
+    {{ cargo_env }}cargo test --workspace --manifest-path plugins/Cargo.toml {{ args }}
+
+# Lint the plugin workspace.
+[group("plugins")]
+clippy-plugins:
+    {{ cargo_env }}cargo clippy --workspace --manifest-path plugins/Cargo.toml --all-targets
+
+# Refresh the reviewed plugin workspace dependency lockfile.
+[group("plugins")]
+update-plugins:
+    cargo update --manifest-path plugins/Cargo.toml
+
+# Generate platform icons and both frontend brand variants from the source images.
+[group("desktop")]
+icons:
+    bun scripts/generate-icons.ts
+
+# Refresh the Tauri v2 JS packages and Rust dependency family together. The JS
+# packages are pinned exactly, so the update names the v2 range it may move in.
+[group("desktop")]
+update-tauri:
+    bun update --exact '@tauri-apps/api@^2' '@tauri-apps/cli@^2' '@tauri-apps/plugin-dialog@^2' '@tauri-apps/plugin-fs@^2'
+    cargo update --manifest-path src-tauri/Cargo.toml -p tauri -p tauri-build -p tauri-codegen -p tauri-macros -p tauri-plugin -p tauri-runtime -p tauri-runtime-wry -p tauri-utils -p tauri-plugin-deep-link -p tauri-plugin-dialog -p tauri-plugin-fs
+
+# Run the Tauri desktop app without QR/OCR (Windows).
+[group("desktop")]
+[windows]
+dev: build-components
+    bun scripts/copy-file-viewer-assets.ts
+    {{ cargo_env }}bun scripts/build-plugins.ts
+    {{ windowsenv }}; bun run tauri dev
+
+# Run the Tauri desktop app with standard QR and CUDA OCR (Windows).
+[group("desktop")]
+[windows]
+dev-full: (build-components "--features" "ocr-cuda")
+    bun scripts/copy-file-viewer-assets.ts
+    {{ cargo_env }}bun scripts/build-plugins.ts
+    {{ vsenv }}; bun run tauri dev --features qrcode-standard --config '{{ justfile_directory() }}\src-tauri\tauri.full.conf.json'
+
+# Build the desktop backend and inference component without QR/OCR (Windows).
+[group("desktop")]
+[windows]
+[working-directory("src-tauri")]
+build: build-components
+    {{ windowsenv }}; cargo build --no-default-features --features desktop
+
+# Compile the macOS desktop executable and inference component with its frontend assets.
+[group("desktop")]
+[macos]
+build-macos: (build-components "--release")
+    bun run tauri build --no-bundle
+
+# Build the desktop backend with standard QR and the inference component with CUDA OCR (Windows).
+[group("desktop")]
+[windows]
+[working-directory("src-tauri")]
+build-full: (build-components "--features" "ocr-cuda")
+    {{ vsenv }}; $env:TAURI_CONFIG=Get-Content -Raw -LiteralPath '{{ justfile_directory() }}\src-tauri\tauri.full.conf.json'; cargo build --no-default-features --features 'desktop qrcode-standard'
+
+# Build the desktop release bundle without QR/OCR (Windows).
+[group("desktop")]
+[windows]
+build-release *args: (build-components "--release")
+    {{ cargo_env }}bun scripts/build-plugins.ts --release
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\prune-bundle-dlls.ps1'
+    {{ windowsenv }}; bun run tauri build --config '{{ justfile_directory() }}\src-tauri\tauri.plugins.conf.json' --config '{{ justfile_directory() }}\src-tauri\tauri.components.conf.json' {{ args }}
+
+# Build the desktop release bundle with QR/OCR, models and plugins (Windows).
+[group("desktop")]
+[windows]
+build-release-full *args: (build-components "--release" "--features" "ocr-cuda")
+    {{ cargo_env }}bun scripts/build-plugins.ts --release
+    {{ vsenv }}; bun run tauri build --features qrcode-standard --config '{{ justfile_directory() }}\src-tauri\tauri.plugins.conf.json' --config '{{ justfile_directory() }}\src-tauri\tauri.components.conf.json' --config '{{ justfile_directory() }}\src-tauri\tauri.full.conf.json' {{ args }}
+
+# Build and package the portable Windows desktop app.
+[group("desktop")]
+[windows]
+pack: build-release
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack.ps1'
+
+# Build and package the portable Windows desktop app with QR/OCR.
+[group("desktop")]
+[windows]
+pack-full: build-release-full
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack.ps1' -QrOcr
+
+# Package the existing desktop release without rebuilding.
+[group("desktop")]
+[windows]
+repack:
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack.ps1'
+
+# Package an existing desktop release with QR/OCR resources.
+[group("desktop")]
+[windows]
+repack-full:
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack.ps1' -QrOcr
+
+# Run the CLI without QR/OCR.
+[group("cli")]
+[working-directory("src-tauri")]
+run-cli *args: (build-components "--quiet")
+    @{{ cargo_env }}cargo run --no-default-features --bin lovelycarve-cli -- {{ args }}
+
+# Build the standalone release CLI (no Tauri) and inference component without QR/OCR.
+[group("cli")]
+[windows]
+[working-directory("src-tauri")]
+build-cli: (build-components "--release")
+    {{ windowsenv }}; cargo build --no-default-features --release --bin lovelycarve-cli
+
+# Build the standalone release CLI (no Tauri) and inference component without QR/OCR.
+[group("cli")]
+[unix]
+[working-directory("src-tauri")]
+build-cli: (build-components "--release")
+    cargo build --no-default-features --release --bin lovelycarve-cli
+
+# Build the standalone release CLI with standard QR and the inference component with CUDA OCR.
+[group("cli")]
+[windows]
+[working-directory("src-tauri")]
+build-cli-full: (build-components "--release" "--features" "ocr-cuda")
+    {{ vsenv }}; cargo build --no-default-features --features qrcode-standard --release --bin lovelycarve-cli
+
+# Build the standalone release CLI with standard QR and the inference component with CPU OCR.
+[group("cli")]
+[unix]
+[working-directory("src-tauri")]
+build-cli-full: (build-components "--release" "--features" "ocr")
+    cargo build --no-default-features --features qrcode-standard --release --bin lovelycarve-cli
+
+# Build the development CLI and inference component and run end-to-end smoke tests.
+[group("cli")]
+test-cli: build-components
+    {{ cargo_env }}cd src-tauri && cargo build --no-default-features --bin lovelycarve-cli
+    {{ python }} scripts/test-cli.py {{ cli_executable }}
+
+# Smoke-test an existing CLI executable.
+[group("cli")]
+smoke-cli executable:
+    {{ python }} scripts/test-cli.py '{{ executable }}'
+
+# Regenerate the agent skill's command reference from the CLI command tree.
+[group("cli")]
+[working-directory("src-tauri")]
+update-cli-skill:
+    {{ cargo_env }}cargo test --no-default-features --lib cli::skill_tests::update_command_reference -- --ignored --exact
+
+# Build and package the Windows CLI without QR/OCR.
+[group("cli")]
+[windows]
+pack-cli: build-cli
+    {{ cargo_env }}bun scripts/build-plugins.ts --release
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack-cli.ps1'
+
+# Build and package the full Windows CLI with QR/OCR and plugins.
+[group("cli")]
+[windows]
+pack-cli-full: build-cli-full
+    {{ cargo_env }}bun scripts/build-plugins.ts --release
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack-cli.ps1' -RequireQrOcr
+
+# Package an existing Windows CLI release using its actual capabilities.
+[group("cli")]
+[windows]
+repack-cli:
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack-cli.ps1'
+
+# Stage the existing Windows CLI release and runtime beside the agent skill.
+[group("cli")]
+[windows]
+stage-cli-skill:
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\pack-cli.ps1' -StageSkill
+
+# Test the read-only Rust ReFS port independently of the desktop host.
+[group("readers")]
+[working-directory("src-tauri/vendor/refs-reader")]
+test-refs *args:
+    cargo test {{ args }}
+
+# Run the ReFS probe tests against the explicitly enabled legacy DLL oracle.
+[group("readers")]
+[working-directory("src-tauri")]
+test-refs-oracle *args:
+    @{{ cargo_env }}cargo test --no-default-features --features refs-dll-oracle --example probe_refs_rust {{ args }}
+
+# Check the Rust ReFS parser without desktop dependencies.
+[group("readers")]
+[working-directory("src-tauri/vendor/refs-reader")]
+clippy-refs:
+    cargo clippy --all-targets
+
+# Lint the standalone pure Rust JFFS2 reader.
+[group("readers")]
+[working-directory("src-tauri/vendor/jffs2")]
+clippy-jffs2:
+    cargo clippy --all-targets -- -D warnings
+
+# Lint the maintained SquashFS reader and enabled legacy variants.
+[group("readers")]
+[working-directory("src-tauri/vendor/backhand")]
+clippy-squashfs:
+    cargo clippy --all-targets --features v1_v2,v3_ddwrt,v3_lzma
+
+# Lint the bounded Sercomm ZIP/NAND reader.
+[group("readers")]
+[working-directory("src-tauri/vendor/sercomm-firmware")]
+clippy-sercomm:
+    cargo clippy --all-targets -- -D warnings
+
+[group("readers")]
+[working-directory("src-tauri/vendor/yaffs2-reader")]
+clippy-yaffs2:
+    cargo clippy --all-targets -- -D warnings
+
+# Run the library tests of a vendored crate without a dedicated reader recipe.
+[group("readers")]
+test-vendor name *args:
+    cargo test --manifest-path src-tauri/vendor/{{ name }}/Cargo.toml --lib {{ args }}
+
+# Validate the Minix V1/V2/V3 reader, including util-linux reference images.
+[group("readers")]
+test-minix:
+    cargo test --manifest-path src-tauri/vendor/minix-reader/Cargo.toml --lib
+
+# Validate the classic HFS reader (data/resource forks and B-tree corruption).
+[group("readers")]
+test-classic-hfs:
+    cargo test --manifest-path src-tauri/vendor/classic-hfs/Cargo.toml --lib
+
+[group("readers")]
+clippy-classic-hfs:
+    cargo clippy --manifest-path src-tauri/vendor/classic-hfs/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-hfs-fixtures:
+    {{ python }} scripts/hfs-fixtures.py
+
+[group("readers")]
+test-jfs:
+    cargo test --manifest-path src-tauri/vendor/jfs-reader/Cargo.toml --lib
+
+# Pure Rust ReiserFS 3.5/3.6 reader and independent fixtures.
+[group("readers")]
+test-reiserfs:
+    cargo test --manifest-path src-tauri/vendor/reiserfs-reader/Cargo.toml --lib
+
+[group("readers")]
+test-amiga:
+    cargo test --manifest-path src-tauri/vendor/amiga-reader/Cargo.toml --lib
+
+[group("readers")]
+test-befs *args:
+    cargo test --manifest-path src-tauri/vendor/befs-reader/Cargo.toml --lib {{ args }}
+
+[group("readers")]
+test-gfs2 *args:
+    cargo test --manifest-path src-tauri/vendor/gfs2-reader/Cargo.toml --lib {{ args }}
+
+[group("readers")]
+clippy-gfs2:
+    cargo clippy --manifest-path src-tauri/vendor/gfs2-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-gfs2-fixtures:
+    {{ python }} scripts/gfs2-fixtures.py
+
+[group("readers")]
+test-gfs2-native:
+    cargo test --manifest-path src-tauri/vendor/gfs2-reader/Cargo.toml --lib native_linux -- --ignored --nocapture
+
+[group("readers")]
+test-ocfs2 *args:
+    cargo test --manifest-path src-tauri/vendor/ocfs2-reader/Cargo.toml --lib {{ args }}
+
+[group("readers")]
+clippy-ocfs2:
+    cargo clippy --manifest-path src-tauri/vendor/ocfs2-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-ocfs2-fixtures:
+    {{ python }} scripts/ocfs2-fixtures.py
+
+# Audit external mkfs.ocfs2 / Linux / fsck inputs; requires OCFS2_ORACLE_DIR.
+[group("readers")]
+test-ocfs2-native:
+    cargo test --manifest-path src-tauri/vendor/ocfs2-reader/Cargo.toml --lib native_linux -- --ignored --nocapture
+
+[group("readers")]
+test-nilfs2 *args:
+    cargo test --manifest-path src-tauri/vendor/nilfs2-reader/Cargo.toml --lib {{ args }}
+
+[group("readers")]
+test-bcachefs *args:
+    cargo test --manifest-path src-tauri/vendor/rust-fs-bcachefs/Cargo.toml --lib {{ args }}
+
+[group("readers")]
+clippy-bcachefs:
+    cargo clippy --manifest-path src-tauri/vendor/rust-fs-bcachefs/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+test-bcachefs-reader *args:
+    cargo test --manifest-path src-tauri/vendor/bcachefs-reader/Cargo.toml --lib {{ args }}
+
+[group("readers")]
+generate-bcachefs-fixtures:
+    {{ python }} scripts/bcachefs-fixtures.py
+
+[group("readers")]
+clippy-bcachefs-reader:
+    cargo clippy --manifest-path src-tauri/vendor/bcachefs-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+test-bcachefs-native:
+    cargo test --manifest-path src-tauri/vendor/bcachefs-reader/Cargo.toml --lib native_linux -- --ignored --nocapture
+
+[group("readers")]
+clippy-nilfs2:
+    cargo clippy --manifest-path src-tauri/vendor/nilfs2-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+test-nilfs2-native:
+    cargo test --manifest-path src-tauri/vendor/nilfs2-reader/Cargo.toml --lib native_linux -- --ignored --nocapture
+
+[group("readers")]
+generate-nilfs2-fixtures:
+    {{ python }} scripts/nilfs2-fixtures.py
+
+[group("readers")]
+clippy-befs:
+    cargo clippy --manifest-path src-tauri/vendor/befs-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-befs-fixtures:
+    {{ python }} scripts/befs-fixtures.py
+
+[group("readers")]
+test-befs-native *args:
+    {{ python }} scripts/befs-native-oracle.py {{ args }}
+
+[group("readers")]
+test-amiga-ffs:
+    cargo test --manifest-path src-tauri/vendor/amiga-ffs/Cargo.toml --lib
+
+[group("readers")]
+test-amiga-rdb:
+    cargo test --manifest-path src-tauri/vendor/amiga-rdb/Cargo.toml --lib
+
+[group("readers")]
+clippy-amiga:
+    cargo clippy --manifest-path src-tauri/vendor/amiga-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-amiga-fixtures:
+    {{ python }} scripts/amiga-fixtures.py
+
+[group("readers")]
+clippy-reiserfs:
+    cargo clippy --manifest-path src-tauri/vendor/reiserfs-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-reiserfs-fixtures:
+    {{ python }} scripts/reiserfs-fixtures.py
+
+[group("readers")]
+clippy-jfs:
+    cargo clippy --manifest-path src-tauri/vendor/jfs-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-jfs-fixtures:
+    {{ python }} scripts/jfs-fixtures.py
+
+[group("readers")]
+clippy-minix:
+    cargo clippy --manifest-path src-tauri/vendor/minix-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-minix-fixtures:
+    {{ python }} scripts/minix-fixtures.py
+
+# Validate/lint the UDF physical-partition reader and its reference fixtures.
+[group("readers")]
+test-udf:
+    cargo test --manifest-path src-tauri/vendor/lamfold-udf/Cargo.toml --lib
+
+[group("readers")]
+clippy-udf:
+    cargo clippy --manifest-path src-tauri/vendor/lamfold-udf/Cargo.toml --all-targets -- -D warnings
+    cargo check --manifest-path src-tauri/vendor/lamfold-udf/Cargo.toml --no-default-features
+
+[group("readers")]
+generate-udf-fixtures:
+    {{ python }} scripts/udf-fixtures.py
+
+# Lint the standalone MINIFS reader, including regression tests.
+[group("readers")]
+clippy-minifs:
+    cargo clippy --manifest-path src-tauri/vendor/minifs/Cargo.toml --all-targets -- -D warnings
+
+# Validate the standalone flash filesystem readers.
+[group("readers")]
+test-qnx:
+    cargo test --manifest-path src-tauri/vendor/qnx-reader/Cargo.toml --lib
+
+[group("readers")]
+clippy-qnx:
+    cargo clippy --manifest-path src-tauri/vendor/qnx-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-qnx-fixtures:
+    {{ python }} scripts/qnx-fixtures.py
+
+[group("readers")]
+test-qnx-reference oracle:
+    {{ python }} scripts/qnx-reference.py '{{ oracle }}'
+
+[group("readers")]
+test-erofs:
+    cargo test --manifest-path src-tauri/vendor/lamfold-erofs/Cargo.toml --lib --features deflate,zstd,lzma
+
+[group("readers")]
+clippy-erofs:
+    cargo clippy --manifest-path src-tauri/vendor/lamfold-erofs/Cargo.toml --all-targets --features deflate,zstd,lzma -- -D warnings
+
+[group("readers")]
+clippy-f2fs:
+    cargo clippy --manifest-path src-tauri/vendor/f2fs-reader/Cargo.toml --all-targets -- -D warnings
+
+[group("readers")]
+generate-f2fs-fixtures:
+    {{ python }} scripts/f2fs-fixtures.py
+
+# Generate independent MINIFS fixtures, or a Python oracle for external firmware.
+[group("readers")]
+generate-minifs-fixtures *args:
+    {{ python }} scripts/minifs-fixtures.py {{ args }}
+
+# Lint the adapted read-only UBI library and its synthetic tests.
+[group("readers")]
+[working-directory("src-tauri/vendor/ubidump")]
+clippy-ubi:
+    cargo clippy --all-targets -- -D warnings
+
+# Test the standalone single/split RAW reader and new-output writer.
+[group("readers")]
+[working-directory("src-tauri/vendor/smraw")]
+test-smraw *args:
+    cargo test {{ args }}
+
+# Lint the standalone single/split RAW reader and every test target.
+[group("readers")]
+[working-directory("src-tauri/vendor/smraw")]
+clippy-smraw *args:
+    cargo clippy --all-targets {{ args }}
+
+# Test the standalone pure Rust GZIP member reader and its independent corpus.
+[group("readers")]
+[working-directory("src-tauri/vendor/gzipf")]
+test-gzipf *args:
+    cargo test {{ args }}
+
+# Lint the GZIP reader without desktop dependencies.
+[group("readers")]
+[working-directory("src-tauri/vendor/gzipf")]
+clippy-gzipf *args:
+    cargo clippy --all-targets {{ args }}
+
+# Test the FileVault core and forensic auditor, including optional libfvde oracle.
+[group("readers")]
+[working-directory("src-tauri/vendor/filevault")]
+test-filevault *args:
+    cargo test --workspace {{ args }}
+
+# Lint the FileVault core, forensic auditor and every test target.
+[group("readers")]
+[working-directory("src-tauri/vendor/filevault")]
+clippy-filevault:
+    cargo clippy --workspace --all-targets
+
+# Lint the standalone HFS+ / HFSX reader and every test target.
+[group("readers")]
+[working-directory("src-tauri/vendor/hfsplus")]
+clippy-hfsplus:
+    cargo clippy --all-targets
+
+# Test the APFS reader and deterministic transaction/stream fixtures.
+[group("readers")]
+[working-directory("src-tauri/vendor/apfs")]
+test-apfs *args:
+    cargo test --lib {{ args }}
+
+# Lint the standalone APFS reader without desktop dependencies.
+[group("readers")]
+[working-directory("src-tauri/vendor/apfs")]
+clippy-apfs:
+    cargo clippy --all-targets
+
+# Test the EWF reader and corpus regressions.
+[group("readers")]
+[working-directory("src-tauri/vendor/ewf")]
+test-ewf *args:
+    cargo test {{ args }}
+
+# Test VMDK with full encodings, tracing and fixture helpers.
+[group("readers")]
+[working-directory("src-tauri/vendor/vmdk")]
+test-vmdk *args:
+    cargo test --features full-encoding,trace,test-helpers {{ args }}
+
+# Test the VHD reader and image fixtures.
+[group("readers")]
+[working-directory("src-tauri/vendor/vhd")]
+test-vhd *args:
+    cargo test {{ args }}
+
+# Test the VHDX reader and image fixtures.
+[group("readers")]
+[working-directory("src-tauri/vendor/vhdx")]
+test-vhdx *args:
+    cargo test {{ args }}
+
+# Test the QCOW 1/2/3 reader and independent fixtures.
+[group("readers")]
+[working-directory("src-tauri/vendor/qcow2")]
+test-qcow2 *args:
+    cargo test {{ args }}
+
+# Lint the QCOW reader and every test target.
+[group("readers")]
+[working-directory("src-tauri/vendor/qcow2")]
+clippy-qcow2:
+    cargo clippy --all-targets -- -D warnings
+
+# Regenerate invented QCOW fixtures (Python cryptography required).
+[group("readers")]
+generate-qcow-fixtures:
+    {{ python }} src-tauri/vendor/qcow2/tests/data/generate.py
+
+# Test the standalone Parallels reader and malformed-image regressions.
+[group("readers")]
+[working-directory("src-tauri/vendor/phdi")]
+test-phdi *args:
+    cargo test {{ args }}
+
+# Lint the Parallels reader and every test target.
+[group("readers")]
+[working-directory("src-tauri/vendor/phdi")]
+clippy-phdi:
+    cargo clippy --all-targets -- -D warnings
+
+# Test the VDI reader.
+[group("readers")]
+[working-directory("src-tauri/vendor/vdi")]
+test-vdi:
+    cargo test
+
+# Test the BitLocker reader and decryptor.
+[group("readers")]
+[working-directory("src-tauri/vendor/bitlocker")]
+test-bitlocker *args:
+    cargo test {{ args }}
+
+# Lint the BitLocker reader, including its independent corpus tests.
+[group("readers")]
+[working-directory("src-tauri/vendor/bitlocker")]
+clippy-bitlocker *args:
+    cargo clippy --all-targets {{ args }}
+
+# Test the Volume Shadow Copy reader; set VSC_ORACLE_IMAGE to dfVFS vss.raw for the pyvshadow oracle.
+[group("readers")]
+[working-directory("src-tauri/vendor/vsc")]
+test-vsc *args:
+    cargo test {{ args }}
+
+# Lint the standalone Volume Shadow Copy reader and its probes.
+[group("readers")]
+[working-directory("src-tauri/vendor/vsc")]
+clippy-vsc:
+    cargo clippy --all-targets -- -D warnings
+
+# Inspect a raw NTFS volume's VSS header, stores and raw block/range metadata.
+[group("readers")]
+[working-directory("src-tauri/vendor/vsc")]
+probe-vsc *args:
+    cargo run --example inspect -- {{ args }}
+
+# Compare generated pyvshadow whole-volume and range dumps (see tests/oracle/README.md).
+[group("readers")]
+[working-directory("src-tauri/vendor/vsc")]
+compare-vsc directory count:
+    cargo run --release --example differential -- {{ directory }} {{ count }}
+
+# Test the SQLite record carver; its sqlite3 oracle tests need sqlite3 on PATH or SQLITE3_BIN.
+[group("readers")]
+[working-directory("src-tauri/vendor/sqlite-core")]
+test-sqlite-core *args:
+    cargo test {{ args }}
+
+# Test the AD1 logical-image reader; set AD1_USERBSS to a real FTK image for the stored-hash oracle.
+[group("readers")]
+[working-directory("src-tauri/vendor/ad1")]
+test-ad1 *args:
+    cargo test {{ args }}
+
+# Test the iOS backup reader, auditor and independent encrypted fixtures.
+[group("readers")]
+[working-directory("src-tauri/vendor/ios-backup")]
+test-ios-backup *args:
+    cargo test {{ args }}
+
+# Test the LUKS reader.
+[group("readers")]
+[working-directory("src-tauri/vendor/luks")]
+test-luks *args:
+    cargo test {{ args }}
+
+# Lint the LUKS reader and its independent corpus tests.
+[group("readers")]
+[working-directory("src-tauri/vendor/luks")]
+clippy-luks *args:
+    cargo clippy --all-targets {{ args }}
+
+# Test the VeraCrypt reader, its VeraCrypt self-test vectors and its independent corpus.
+[group("readers")]
+[working-directory("src-tauri/vendor/veracrypt")]
+test-veracrypt *args:
+    cargo test {{ args }}
+
+# Lint the VeraCrypt reader and its tests.
+[group("readers")]
+[working-directory("src-tauri/vendor/veracrypt")]
+clippy-veracrypt *args:
+    cargo clippy --all-targets {{ args }}
+
+# Test the KeePass KDBX reader on pykeepass's KeePass / KeePassXC databases and its independent corpus.
+[group("readers")]
+[working-directory("src-tauri/vendor/kdbx")]
+test-kdbx *args:
+    cargo test {{ args }}
+
+# Lint the KeePass KDBX reader and its tests.
+[group("readers")]
+[working-directory("src-tauri/vendor/kdbx")]
+clippy-kdbx *args:
+    cargo clippy --all-targets {{ args }}
+
+# Compare the Rust ReFS port against the explicitly enabled legacy DLL oracle.
+[group("tools")]
+[working-directory("src-tauri")]
+probe-refs *args:
+    @{{ cargo_env }}cargo run --no-default-features --features refs-dll-oracle --example probe_refs_rust -- {{ args }}
+
+# Run a backend example without QR/OCR.
+[group("tools")]
+[working-directory("src-tauri")]
+run-example name *args:
+    @{{ cargo_env }}cargo run --no-default-features --example {{ name }} -- {{ args }}
+
+# Compile all explicitly registered probes and benchmarks without QR/OCR.
+[group("tools")]
+[working-directory("src-tauri")]
+check-examples:
+    {{ cargo_env }}cargo check --no-default-features --examples
+
+# Run an example with release-fast and one Cargo build job.
+[group("tools")]
+[working-directory("src-tauri")]
+run-example-fast name *args:
+    @{{ cargo_env }}cargo run --jobs 1 --no-default-features --profile release-fast --example {{ name }} -- {{ args }}
+
+# Benchmark the filedb index with release-fast.
+[group("tools")]
+[working-directory("src-tauri")]
+bench-filedb-store entries="1000000" *args:
+    @{{ cargo_env }}cargo run --jobs 1 --no-default-features --profile release-fast --example benchmark_filedb_store -- --entries {{ entries }} {{ args }}
+
+# Show the resolved Visual Studio and OpenCV paths.
+[group("opencv")]
+qr-env:
+    @echo "VS_PATH        = {{ vs_path }}"
+    @echo "OPENCV_DIR     = {{ opencv_dir }}"
+    @echo "OPENCV_LIB     = {{ opencv_lib }}"
+    @echo "OPENCV_MSVC    = {{ opencv_msvc }}"
+    @echo "OPENCV_SRC     = {{ opencv_src }}"
+    @echo "OPENCV_CONTRIB = {{ opencv_contrib }}"
+    @echo "OPENCV_INSTALL = {{ opencv_install }}"
+
+# Build contrib OpenCV from source into OPENCV_INSTALL.
+[group("opencv")]
+[windows]
+build-opencv-contrib:
+    pwsh -NoProfile -File '{{ justfile_directory() }}\scripts\build_opencv_contrib.ps1' -VsPath '{{ vs_path }}' -Src '{{ opencv_src }}' -Contrib '{{ opencv_contrib }}' -Install '{{ opencv_install }}'
+
+# Decode a QR image with the standard detector.
+[group("opencv")]
+[windows]
+[working-directory("src-tauri")]
+qr-test image count="1":
+    {{ vsenv }}; cargo run --no-default-features --features qrcode-standard --example qr_test -- '{{ image }}' {{ count }}

@@ -1,0 +1,150 @@
+/* Shared table-browser layout for the database viewers (SQLite / Realm): a
+   table list on the left and the data grid on the right. Inside a file
+   preview the paging controls and the database state live in its status bar
+   and, when the preview is narrow, the table list folds into a dropdown in its
+   view bar (`.source-picker`). Included per component through
+   `<style scoped src>`. */
+
+/* ── Table list ── */
+.table-list {
+  flex: 0 0 200px;
+  min-width: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-color);
+  background: var(--surface-primary);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.table-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  width: 100%;
+  min-height: 30px;
+  border: none;
+  background: none;
+  text-align: left;
+  padding: 0 8px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text-primary);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.table-item:hover {
+  background: var(--hover-bg);
+}
+
+.table-item.active {
+  background: var(--sidebar-active-bg);
+  color: var(--primary-color);
+}
+
+.table-item:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: -2px;
+}
+
+.table-icon {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
+
+.table-item.active .table-icon {
+  color: var(--primary-color);
+}
+
+.table-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-pill {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--chip-count-bg);
+  color: var(--text-secondary);
+}
+
+.row-pill.warn {
+  color: var(--sev-warn-fg);
+  background: var(--sev-warn-bg);
+}
+
+/* The dropdown that stands in for the list in a narrow preview. */
+.source-picker {
+  display: none;
+  max-width: 260px;
+  height: 26px;
+}
+
+@container file-preview (max-width: 639px) {
+  .table-list {
+    display: none;
+  }
+
+  .source-picker {
+    display: inline-flex;
+  }
+}
+
+/* ── Data grid ── */
+.grid-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.grid-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.rownum-th {
+  min-width: 44px;
+}
+
+.rownum {
+  color: var(--text-secondary);
+}
+
+.col-name {
+  color: var(--text-primary);
+}
+
+.col-meta {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* ── Paging (in the preview's status bar) ── */
+.pager-info {
+  align-items: center;
+}
+
+.pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pager-page {
+  min-width: 48px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-align: center;
+}

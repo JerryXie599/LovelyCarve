@@ -1,0 +1,132 @@
+import { describe, expect, it } from 'vitest';
+import type { FsTypeIdent } from '../../../lib/ipc/fs/derived';
+import { usePreviewCategory } from './usePreviewCategory';
+
+const ZIP_MAGIC = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]);
+const TEXT = new TextEncoder().encode('plain text line\nsecond line\n');
+const BINARY = new Uint8Array([0x00, 0x01, 0x02, 0x03, 0xff, 0x00]);
+
+function ident(overrides: Partial<FsTypeIdent>): FsTypeIdent {
+  return {
+    label: 'txt',
+    mime_type: 'text/plain',
+    group: 'text',
+    description: '',
+    extensions: [],
+    is_text: true,
+    score: 0.99,
+    inferred: true,
+    file_len: 0,
+    ...overrides,
+  };
+}
+
+function resolve(options: {
+  ext: string;
+  bytes?: Uint8Array;
+  kind?: 'file' | 'dir';
+  typeIdent?: FsTypeIdent | null;
+}) {
+  const preview = usePreviewCategory({
+    nodeKind: () => options.kind ?? 'file',
+    nodeSize: () => options.bytes?.length ?? 0,
+    ext: () => options.ext,
+    bytes: () => options.bytes ?? new Uint8Array(),
+    effectiveIdent: () => options.typeIdent ?? null,
+    mediaCap: 16 * 1024 * 1024,
+  });
+  return { category: preview.category.value, extMismatch: preview.extMismatch.value };
+}
+
+describe('usePreviewCategory', () => {
+  it('keeps office documents (ZIP containers) in the rich viewer by extension', () => {
+    expect(resolve({ ext: 'docx', bytes: ZIP_MAGIC }).category).toBe('rich');
+    expect(resolve({ ext: 'zip', bytes: ZIP_MAGIC }).category).toBe('zip');
+    expect(resolve({ ext: '', bytes: ZIP_MAGIC }).category).toBe('zip');
+  });
+
+  it('lets a confident type identification win over a renamed extension', () => {
+    const docx = ident({
+      label: 'docx',
+      mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      is_text: false,
+      extensions: ['docx'],
+    });
+    expect(resolve({ ext: 'zip', bytes: ZIP_MAGIC, typeIdent: docx })).toEqual({ category: 'rich', extMismatch: true });
+  });
+
+  it('ignores low-confidence inferences', () => {
+    const guess = ident({ label: 'zip', mime_type: 'application/zip', is_text: false, score: 0.5 });
+    expect(resolve({ ext: 'docx', bytes: ZIP_MAGIC, typeIdent: guess }).category).toBe('rich');
+  });
+
+  it('keeps text-based rich formats out of the code view', () => {
+    expect(resolve({ ext: 'eml', bytes: TEXT, typeIdent: ident({}) }).category).toBe('rich');
+  });
+
+  it('falls back to byte sniffing without a known extension', () => {
+    expect(resolve({ ext: '', bytes: TEXT }).category).toBe('code');
+    expect(resolve({ ext: '', bytes: BINARY }).category).toBe('unsupported');
+    expect(resolve({ ext: 'crc', bytes: TEXT }).category).toBe('code');
+  });
+
+  it('opens KeePass databases by extension or signature, over a content guess', () => {
+    const kdbx = new Uint8Array([0x03, 0xd9, 0xa2, 0x9a, 0x67, 0xfb, 0x4b, 0xb5, 0x01, 0x00, 0x04, 0x00]);
+    const preRelease = new Uint8Array([0x03, 0xd9, 0xa2, 0x9a, 0x66, 0xfb, 0x4b, 0xb5]);
+    const keepass1 = new Uint8Array([0x03, 0xd9, 0xa2, 0x9a, 0x65, 0xfb, 0x4b, 0xb5, 0x00]);
+    expect(resolve({ ext: 'kdbx' }).category).toBe('kdbx');
+    expect(resolve({ ext: 'dat', bytes: kdbx }).category).toBe('kdbx');
+    expect(resolve({ ext: '', bytes: preRelease }).category).toBe('kdbx');
+    expect(resolve({ ext: 'txt', bytes: kdbx, typeIdent: ident({}) }).category).toBe('kdbx');
+    expect(resolve({ ext: 'kdb', bytes: keepass1 }).category).toBe('unsupported');
+  });
+
+  it('keeps directories out of file viewers even when content hints exist', () => {
+    expect(resolve({ ext: 'sqlite', kind: 'dir', bytes: TEXT, typeIdent: ident({}) }).category).toBe('unsupported');
+  });
+
+  it('detects LevelDB (.ldb/.sst) and falls back to ordinary content detection for removed mmkv format', () => {
+    expect(resolve({ ext: 'ldb', bytes: TEXT }).category).toBe('leveldb');
+    expect(resolve({ ext: 'sst', bytes: BINARY }).category).toBe('leveldb');
+    for (const ext of ['mmkv']) {
+      expect(resolve({ ext, bytes: TEXT }).category).toBe('code');
+      expect(resolve({ ext, bytes: BINARY }).category).toBe('unsupported');
+      expect(resolve({ ext, typeIdent: ident({ label: 'sqlite', is_text: false }) }).category).toBe('sqlite');
+    }
+  });
+
+  it('detects EVTX files by extension and magic header', () => {
+    const EVTX_MAGIC = new Uint8Array([0x45, 0x6c, 0x66, 0x46, 0x69, 0x6c, 0x65, 0x00]);
+    expect(resolve({ ext: 'evtx', bytes: EVTX_MAGIC }).category).toBe('evtx');
+    expect(resolve({ ext: '', bytes: EVTX_MAGIC }).category).toBe('evtx');
+    expect(resolve({ ext: 'dat', bytes: EVTX_MAGIC }).category).toBe('evtx');
+    expect(resolve({ ext: 'log', bytes: EVTX_MAGIC, typeIdent: ident({ label: 'evtx', is_text: false }) }).category).toBe('evtx');
+  });
+
+  it('detects primary Windows Registry Hives (regf) and ignores transaction logs', () => {
+    const HIVE_PRIMARY = new Uint8Array(64);
+    HIVE_PRIMARY.set([0x72, 0x65, 0x67, 0x66], 0); // "regf", FileType=0 at 0x1c
+    expect(resolve({ ext: '', bytes: HIVE_PRIMARY }).category).toBe('registry');
+    expect(resolve({ ext: 'dat', bytes: HIVE_PRIMARY }).category).toBe('registry');
+    expect(resolve({ ext: 'hve', bytes: HIVE_PRIMARY }).category).toBe('registry');
+
+    const HIVE_LOG = new Uint8Array(64);
+    HIVE_LOG.set([0x72, 0x65, 0x67, 0x66], 0);
+    HIVE_LOG[28] = 6; // FileType=6 transaction log
+    expect(resolve({ ext: 'log1', bytes: HIVE_LOG }).category).toBe('unsupported');
+  });
+
+  it('detects NTFS $MFT / $MFTMirr record #0 headers strongly', () => {
+    const MFT = new Uint8Array(64);
+    MFT.set([0x46, 0x49, 0x4c, 0x45], 0); // "FILE"
+    const view = new DataView(MFT.buffer);
+    view.setUint16(6, 3, true); // usa_count
+    view.setUint16(20, 56, true); // first_attr_offset
+    view.setUint16(22, 1, true); // in_use
+    view.setUint32(24, 512, true); // used_size
+    view.setUint32(28, 1024, true); // alloc_size
+    view.setUint32(44, 0, true); // record_number == 0
+    expect(resolve({ ext: '', bytes: MFT }).category).toBe('mft');
+    expect(resolve({ ext: 'bin', bytes: MFT, typeIdent: ident({ label: 'txt', is_text: true }) }).category).toBe('mft');
+  });
+});

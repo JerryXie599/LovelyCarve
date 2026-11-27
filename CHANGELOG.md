@@ -1,0 +1,408 @@
+# Changelog
+
+本文件记录 LovelyCarve 的重要变更。
+
+格式遵循 [Keep a Changelog 0.3.0](https://keepachangelog.com/zh-CN/0.3.0/)，
+版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。条目以用户可感知的变化为主，按版本倒序排列。
+
+## [Unreleased]
+
+### Added
+
+- 官方插件发布页可以在桌面版打开指定插件版本。LovelyCarve 自动下载当前平台的插件包，检视确认后安装到用户插件目录。
+- 官方[插件发布页](https://lovelyteams.github.io/LovelyCarve-Plugin-Site/)提供 `.lcpkg` 下载、运行平台、版本和 SHA-256，可复制同一份索引的地址添加到「设置 → 插件市场」。
+- 解锁后的 BitLocker 卷按卷首识别文件系统：BitLocker To Go 卷中的 FAT / exFAT 可以浏览，卷内的 NTFS 卷影副本与盘符还原也照常可用。卷影副本、盘符还原和树图同样覆盖 LUKS、VeraCrypt 中解锁出的 NTFS。
+- 打开含锁定加密分区的镜像时，「检测到加密分区」提示覆盖 BitLocker、LUKS 与 FileVault 2。
+- VeraCrypt / TrueCrypt 解锁支持密钥文件（文件与文件夹，可只用密钥文件）、BLAKE2s-256 与 Argon2id 密钥派生、Camellia 与 Kuznyechik 及其级联、卷内嵌的备份卷头，以及系统加密：从磁盘第 62 扇区读取卷头，在被加密的系统分区上原位解锁，或把整盘读成明文的新检材；暂停的系统加密按 VeraCrypt 的方式读取并提示「加密未完成」。「卷头」「密钥派生」可缩小搜索范围，结果给出所用卷头、PRF、迭代次数与算法。
+- KeePass 密码库（`.kdbx`，或以 KDBX 签名开头的改名文件）的原类型视图：无需密码即可查看外部头部与密钥派生参数；用主密码、密钥文件（同目录检材文件或主机文件）或转换密钥解密后，浏览群组与回收站、条目与全部字段（受保护字段默认遮蔽）、字段引用解析结果、历史版本及其改动、附件内容、自定义数据与已删除对象。读取器 `kdbx-reader` 是 pykeepass 读取部分的纯 Rust 改写，支持 KDBX 3.x / 4.x、AES / Twofish / ChaCha20、AES-KDF / Argon2d / Argon2id，校验头部与每个数据块。CLI `inspect` 识别 KDBX，`--password`、`--keyfile`、`--transformed-key` 解密。
+- `lovelycarve://` 链接：文件列表与树图、全局搜索命中、时间线文件事件和分析记录的右键菜单可复制指向该处的链接，CLI 用 `case link [路径] [--offset <字节>] [--length <字节>]` 生成。点击链接即打开对应案件与检材，在文件列表中选中该文件并打开预览，带字节范围时在十六进制视图中高亮；另一个案件已打开时先确认切换。链接按案件 uid、检材 ID 与节点 ID 指向位置，不含主机路径。已有窗口运行时，链接交给打开着该案件的窗口或空闲窗口，多个窗口仍可同时运行。安装包注册该协议，便携版与开发版启动时为当前用户注册。
+- 插件市场（「设置 → 插件市场」，CLI `plugin market`）：添加 `https://` 索引源或本地、网络驱动器上的市场目录，浏览插件、版本与安装状态（未安装、可更新、已安装更新版本等），安装或更新任一版本。下载按索引列出的大小与 SHA-256 校验，插件包的 ID 与版本必须与索引一致，确认检视结果后才安装；没有镜像或回退，只读取已配置的源。`plugin market index <目录> --title <标题>`（`just market-index`）为一个目录的 `.lcpkg` 生成 `index.json`，从库文件头识别平台。
+- 安装插件包前先检视：「安装插件包…」与 CLI `plugin install` / 新增的 `plugin inspect` 先读出插件 ID、版本、说明、发布者、许可证、权限、分析器和压缩包与库文件的 SHA-256，标出新安装、升级、降级、重新安装或「同版本号的不同构建」，确认后才安装；安装前暂存的库在插件进程中先通过启动校验，失败时已安装的版本保持不变。不能安装的原因（内置插件、缺少当前平台的库、检视后被修改、库未通过校验、旧版本仍在使用等）分别说明，并附原始诊断。
+- 插件清单可声明 `description`、`publisher`、`license`（`plugin.description` 键翻译说明），插件包可带 `README.md`；「设置 → 插件」显示说明、发布者与许可证，详情中可展开说明文档。
+- 分析运行的审计记录任务实例加载的插件库文件的 SHA-256（「分析结果」的运行信息与 CLI `results run` 的 `librarySha256`），同版本号的不同构建因此可以区分。
+- 插件 SDK 的测试工具 `TestRun::snapshot()` 把一次运行的全部输出写成稳定文本，供 `insta` 快照测试；`linuxinfo` 用它覆盖整次运行。
+
+### Changed
+
+- **破坏性变更**：插件清单的 `version` 必须是语义化版本（如 `1.2.0`），否则插件包不会加载。
+- **破坏性变更**：IPC `plugin_install` 必须带检视结果中的 `sha256`；CLI `plugin install` 需要确认（`-y`）。
+- **破坏性变更**：检材的 `records.db` 结构升到第 2 版（运行记录库文件的 SHA-256）；旧版本生成的插件结果库不再打开，需从案件移除该检材后重新添加并重新分析。
+- BitLocker、LUKS、VeraCrypt 与 FileVault 2 共用一条解锁路径：桌面端在同一张表单中选择格式、区域与凭据并统一提交，所有解锁都在任务中心后台进行、可取消；BitLocker 的用户密码、恢复密钥、内存镜像 VMK 与其他密钥（BEK、VMK、FVEK / TWEAK、明文密钥）是这张表单的凭据选项。锁定的加密分区行只有一个「解锁」按钮，解锁后按明文文件系统显示，并标出「BitLocker 已解锁」等标签。
+- VeraCrypt 只能解锁大小为检材扇区整数倍的区域：弹窗不再列出其他区域，CLI 与后端以 `invalidInput` 拒绝。
+- 桌面端去掉解释性文字：弹窗副标题、表单提示、选项卡片说明、空状态说明和通知正文只保留对象、数值、真实错误与完整性告警，输入格式错误时才显示字段提示；原先的用法说明移入[使用指南](docs/USAGE.md)。
+- 解锁后的整盘导出统一由镜像头部「导出源镜像」（CLI `evidence export <别名> --unlocked`）完成，BitLocker 分区行的单独导出已移除。
+- VeraCrypt 头部搜索在全部核心上并行派生密钥，先尝试单一加密算法所需的密钥，可随时取消，任务中心显示派生进度；默认同时尝试标准卷与隐藏卷，与 VeraCrypt 挂载时一致。解锁后按偏移读取，密钥扩展只做一次，大范围读取并行解密，多个读取不再互相等待。
+- **破坏性变更**：IPC 的 `encrypted_volume_unlock` 改用 `credential`（按 `kind` 区分的凭据）并接受 `scheme: "bitlocker"`；`ImageInfo.unlocked_partitions` 改为 `{ id, scheme }` 列表；`bitlocker_metadata` 更名为 `bitlocker_inspect`；`bitlocker_status`、`bitlocker_unlock`、`bitlocker_unlock_with_vmk`、`bitlocker_export_decrypted_image` 与 `bitlocker-unlock-progress` 事件已移除。
+- **破坏性变更**：CLI 的 BitLocker `unlock` 与其他格式输出同样的结果（`path`、`scheme`、`cipher`、`image`、`volumeKey`；VMK 派生的恢复密码在 `recoveryPassword`），锁定的 BitLocker 分区列为 `unsupported:N`，`part:N` 仍可指向它；`volumes` 为所有解锁的加密卷显示格式与状态；`evidence export /<别名>/part:N` 已移除。
+- **破坏性变更**：IPC `encrypted_volume_unlock` 的 VeraCrypt 选项 `hidden` 改为 `header`（`auto` / `normal` / `hidden` / `backup` / `system`），新增 `prf` 与 `keyfiles`，结果新增 `veracrypt`；CLI `unlock` 的 `--hidden` 改为 `--header hidden`，新增 `--header`、`--prf` 与 `--keyfile`。PIM 上限改为 VeraCrypt 的 2147468（系统加密 65535）。
+
+### Fixed
+
+- CLI `plugin ls` 的文本输出列出插件包（此前表格为空）。
+- 插件包中的条目若是 Windows 设备名（如 `locales/CON.toml`）、带保留字符或以点、空格结尾，或同一路径出现两次，安装时拒绝，不再写出这样的文件。
+- VeraCrypt：设置了 PIM 的 RIPEMD-160 卷按 `15000 + 1000·PIM` 次迭代派生（此前误用系统加密公式），TrueCrypt 卷按 TrueCrypt 自己的迭代次数派生，二者此前都无法打开；就地加密完成的卷、4096 字节扇区的卷和卷头版本 3–4 的 TrueCrypt 卷不再被拒绝。
+
+## [1.4.0] - 2026-11-23
+
+### Added
+
+- 文件列表的预览可同时打开同一检材的多个文件：单击文件在预览位查看，双击、Enter 或菜单「预览」保持打开，勾选的多个文件可一次各开一个标签页。打开的文件不随目录切换关闭，切回时保留视图、搜索与滚动位置；每个检材记住自己打开的文件。
+- 案件操作审计记录案件检材上的任务：哈希、导出、恢复、搜索、时间线、快照等任务开始时记 `task.started`，结束时以 `task.settled` 记录结局、对象与计数；案件先关闭或进程中断的任务保持未完成，不补写结束时间。
+- 带索引的 BCP ZIP 可直接导入案件。导入结果进入桌面端「分析结果」与 CLI 的通用分析结果命令，并保留记录来源。
+- VHDX 差分盘可按相对路径只读打开父链。逐层校验父盘身份与几何，并将所有父盘纳入检材指纹和源变化检测。
+
+### Changed
+
+- **破坏性变更**：重新设计 `lovelycarve-cli`，旧命令不再可用，也不提供别名。
+  - 检材内的位置统一写成地址：`/` 列出检材，`/<别名>` 列出分区与卷，`/<别名>/<卷>/<路径>` 指向文件，`/<别名>/@<节点 ID>` 按 ID 指向节点；别名保存在案件中。`--path`、`--node-id`、`--parent-id` 与会话上下文（`context set` / `context use`）不再使用，shell 中用 `cd` / `pwd`。
+  - 读取检材内容用 `ls`、`tree`、`stat`、`cat`、`text`、`strings`、`hash`、`identify`、`streams`、`export`、`find`、`grep`，其余命令为「名词 动词」；没有专门命令的后端功能用 `rpc <后端命令> --body <JSON>` 调用，`rpc --list` 列出全部。
+  - 结果默认输出文本，`--json` 输出 JSON：`--json=字段` 取代 `--fields`，文件内容为 `{"encoding":"hex","data"}`，错误为标准错误上的一行 JSON，进度关闭。`--with-source`、`LOVELYCARVE_AGENT` 和按编码代理环境变量切换输出的行为已移除。
+  - 命名常驻会话（`sessions …`、`--session`）改为每个案件一个后台进程：`case open` / `case close`，之后指向该案件的命令自动交给它执行。没有后台进程时，解锁、手动组装、雕刻、卷影副本和挂载等只在进程存活期间有效的命令以 `needsBackend` 拒绝。
+  - JSONL `session` 改为 `batch`：每行请求是命令行本身，`{"id":…,"argv":[…]}`，`argv` 中可用 `$ref` 引用先前的结果。
+  - 密码与密钥不再接受命令行上的明文：用 `@文件`、`-`（标准输入）或在终端中输入。删除确认的 `--force` 改为 `-y`；`--image` 只接受检材路径；`.env` / `.env.local` 及 `LOVELYCARVE_IMAGE`、`LOVELYCARVE_SESSION` 不再读取。
+  - LUKS、VeraCrypt 与 FileVault 的 `unlock` 默认把明文接在源检材上，`--new-image` 生成独立的解密检材。`find` 列出范围内没有卷索引的卷并以 2 退出，没有任何索引时以 `indexUnavailable` 失败。
+  - 常用命令对照：`images open` → `evidence add`，`images get` → `evidence show`，`images hash` / `images export` → `evidence hash` / `evidence export`，`files list` → `ls`，`files tree list` → `tree`，`files get` → `stat`，`files read` → `cat`，`files text get` → `text`，`files hash` → `hash`，`files export` / `files directories export` → `export`，`files search` → `grep`，`indexes files list` → `find`，`indexes list` / `indexes create` → `index ls` / `index build`，`cases create` → `case new`，`bitlocker unlock` / `encrypted-volumes unlock` / `ios-backups unlock` → `unlock`，`bitlocker metadata get` / `filevault get` → `encryption`，`raid detect --image-ids` → `raid detect --member`，`carve scans create` / `carve scans export` → `carve start` / `carve export`，`plugins tasks create` → `analyze run`，`analysis records list` → `results rows`，`timezones get` / `timezones set` → `tz` / `tz set`，`system get` → `system`。
+- 文件预览可放在列表右侧或下方；工作区较窄时自动放在列表下方，不再覆盖文件表。
+- 文件列表、目录树、预览标签页和详情面板的文件图标换成一套 16px 线性图标：按文件名和后缀区分常见编程语言、脚本、配置、日志、字体和锁文件；可执行文件、压缩包、表格、邮件和数据库各有专门图标（可执行文件不再显示为齿轮，CSV 显示为表格），展开的目录显示为打开的文件夹。分区、未分配空间、NTFS 命名数据流、ReFS 快照、符号链接和 Docker 视图的图标按同一网格重绘，各类别的颜色不变。
+- 调整其余含义不准的图标：时间线改用甘特图、文件恢复改用恢复箱，分析结果、时间线与文件恢复页的起始图标与侧栏一致，「快速分析」按钮统一为闪电；RAID 在添加检材、检材信息、案件管理与 RAID 检测中统一为磁盘阵列，雕刻范围的「分区间隙」与文件树一样画虚线方框；快速分析的系统图标中 Android 改为 Android 头像，鸿蒙改为手机，Windows 与 ESXi 不再与「应用」「系统」分类共用图标；插件时间线事件改用插件图标，ELF / Mach-O 报告与 PE 一样用二进制图标，结构视图的「适应窗口」改为取景框，源镜像不可用时显示断开连接。
+- 重新设计原类型视图：视图切换与当前视图的工具合成一行，查找栏按查找按钮或 Ctrl+F 打开；真实类型识别、文件大小、文本编码与翻页移到底部状态栏。CSV、JSON / YAML / XML、SQLite、Realm 和 ZIP 不再各自叠一层工具条；面板较窄时 SQLite / Realm 的表清单收进下拉框，ZIP 成员树与成员预览上下排列。PE / ELF / Mach-O / ar / GGUF 报告改为平铺分节，加载、出错和不支持的状态统一给出原因与下一步。
+- 原类型视图新增 CHM、UMD、FB2 电子书，HEIC / HEIF、TIFF、JPEG XL 图片，以及韩文（HWP / HWPX）、WordPerfect 和 dBASE 文件，经 Flyfish File Viewer 渲染。
+- Magika 文件类型识别和 OCR 移入随程序分发的推理组件 `lovelycarve_inference.dll`，ONNX Runtime 与模型随组件在首次使用时加载：Windows CLI 从约 52 MB 降至约 30 MB，桌面主程序同样减少约 22 MB；主程序和 CLI 启动时不再加载 DirectML、D3D12 与 DXGI。安装包、便携包和 CLI 包把组件放在主程序旁；CLI `system` 的 `components.inference` 报告组件能否加载及其 OCR 执行方式。
+- 从源码构建时，OCR 改由推理组件的 `ocr` / `ocr-cuda` 特性开启（`just build-components --features ocr-cuda`），后端 crate 不再提供这两个特性；`*-full` 配方的用法不变。
+- BCP 分析结果按应用、账号和记录类型浏览，并显示各分组的删除数和总数。
+- 桌面端在「卷与分区」的同一弹窗中解锁 BitLocker、LUKS、VeraCrypt 和 FileVault 2，分区行可直接预选对应卷。
+- 卸载检材时先等它的任务停下（最多 5 秒）再释放临时文件、插件卷与挂载，任务中心不再残留已卸载检材的历史。
+- 文件列表开启「隐藏空目录」后仍按页读取：空目录改由后端依据卷快照或索引判定，当页与总数同时排除，不再把整个目录逐页读入前端再过滤；索引上的子树判定改为单连接批量查询。快照尚未覆盖、无法判定的目录先保留显示，不再逐个实时探测子项数来隐藏。
+- 目录树展开改用后端分页：排除已删除项、目录优先并按名称自然排序，大目录只读取到前 300 个文件。
+- 文本预览只从后端取编码检测结果（新命令 `fs_preview_text_encoding`），用已读取的预览字节在前端解码，不再重复传输解码后的文本；NTFS 命名流预览命令 `fs_stream_preview` 改为返回二进制数据。
+- 后端错误码改由错误的类型确定，不再根据报错文字推断，报错文字本身不变：检材结构损坏报 `corruptData`（以往常被标成 `invalidInput` 或 `resourceLimit`），主机上文件不存在、拒绝访问分别报 `notFound`、`permissionDenied`，任务在任何环节被取消都报 `cancelled`。
+- CLI 自己执行的读取命令（如 `cat`、`strings`）失败时报告与后端命令相同的错误码，不再一律为 `operationFailed`；CLI 内部错误改报 `internal`，主机 I/O 错误按类型报 `notFound`、`permissionDenied` 等，不再一律为 `io`。
+- Python 读取库在检材、节点或源镜像不存在时抛 `FileNotFoundError`，主机拒绝访问时抛 `PermissionError`，两者都是 `OSError` 的子类。
+- 从源码构建需要 Rust 1.100 或更新版本。
+- 从源码构建需要 Bun 1.4.5 或更新版本；Vite、Vitest、vue-tsc 与 Tauri CLI 即使系统装有 Node.js 也在 Bun 上运行。
+
+### Removed
+
+- 移除 DSH 取证模式：不再提供 `integrations/dsh-lovelycarve/` 及 `just stage-dsh`、`just test-dsh`，编码代理直接按 CLI skill 调用 CLI。CLI skill 不再含 forensic-board 看板集成。
+- 安装包、便携包和 CLI 包不再附带 `libcrypto-4-x64.dll`：OpenSSL 已静态链接，没有程序再加载它，每个包少约 7 MB。
+
+### Fixed
+
+- 分区签名恢复会继续检查残留引导标记后面的 ext 超级块，并核验 NTFS 的首个 `$MFT` 记录与 APFS 对象映射，避免把孤立标记或检查点当作卷。
+- 镜像缺少分区表时，打开检材可按文件系统签名找回完整的 NTFS、ext2/3/4 与 APFS 卷；操作系统及平台识别会逐个探测 APFS 容器内的卷。
+- 使用 Cargo 1.100 及更新版本时，带 OCR 的完整构建不再因 ONNX Runtime 构建脚本按旧目录层级拷贝 DLL 而失败；CUDA / TensorRT 执行提供者与 DirectML DLL 重新放在推理组件旁。
+- 锁定的案件在后端拒绝添加检材和删除卷索引：CLI 的 `evidence add` 不能再把新检材加入锁定案件，`index rm` 也被拒绝；全部锁定拒绝统一使用错误码 `caseLocked`。
+
+## [1.3.0] - 2026-11-07
+
+### Added
+
+- CLI 与 DSH 新增结构化帮助、合法参数和显式修正请求；来源封装绑定实际检材及 SQLite 主键，超限读取保留原页重试位置；DSH 看板流程跟踪真实提交和回读。
+- 卷列表显示父索引与逻辑卷子树的覆盖关系；索引查询明确区分缺失/截断索引与完整查询的零命中。
+
+- CLI skill 与 DSH 取证模式新增 forensic-board MCP 解题流程：逐题提交并回读答案，及时共享跨题线索、检材归属与验证边界，支持写入失败后的去重恢复。
+- DSH 模式新增 `lovelycarve` 结构化工具，复用命名 CLI 会话，保留 DSH 执行策略、取消、错误、警告及分页来源；超大或截断的输出明确失败。调查默认先建案、等待并核验卷索引，再开始分析。
+- CLI 支持用 `LOVELYCARVE_AGENT=1` 显式启用代理输出，供 DSH 等调用方获取 JSON 错误、警告及小页结果，并关闭终端颜色和交互提示；`system get` 报告实际模式。
+- DSH 取证模式纳入源码维护，支持 `just stage-dsh` 同步提示词、CLI skill 和运行库；按问题选取最小检材范围，避免无需求的整盘哈希、重复装配和将离线安装信息误作运行态证明。
+- `raid detect --image-ids` 可按已加载源检材限定 RAID/LVM 检测，隔离克隆主机的相同 UUID 与组装缓存；帮助和补全仅向列表查询展示可用的 `--fields`。
+
+- 镜像信息页可手动指定检材平台：自动识别有误或没有识别出平台时，从平台列表中选择；选择保存在案件中，优先于自动识别，重新识别也不覆盖，选「自动识别」即恢复自动结论，案件锁定时不可修改。案件管理器标出手动指定的平台，CLI 对应 `images platform set <平台|auto>`。
+
+- 新增 DJI 无人机系统自动识别：联合校验设备厂商、固件属性及飞行 / 导航服务，镜像信息页显示无人机与 DJI，系统列表保留固件版本、设备代号及 Android 基础版本，支持 `dji` 平台的系统分析插件。
+
+- 独立文件预览窗口新增置顶按钮，可切换保持在其他窗口上方。
+
+- 文件名索引查询新增 `filter.nameGlob`，支持忽略大小写的 `*`、`?`、字符组与范围通配，在匹配结果上分页；可与目录前缀、扩展名和类型条件组合。CLI skill 默认先新建案件、加载检材并检查索引就绪，再按文件名查找线索。
+- 新增纯 Rust bcachefs 单设备只读读取：复用 MIT 读取器，支持子卷 / snapshot、硬链接、reflink、压缩、校验、稀疏 / unwritten 和纳秒时间；接入浏览、范围读、哈希、导出、目录快照及 CLI，保持不同历史视图中的同号 inode 内容独立。
+
+- 新增纯 Rust NILFS2 2.0 只读读取：支持双超级块、日志 CRC、DAT / 分配位图、direct / B-tree、硬链接、稀疏文件及纳秒时间；接入当前提交视图的浏览、范围读、哈希、导出、快照和 CLI，独立读取器另支持保留的历史检查点；dirty / recovery 状态明确拒绝。
+
+- 新增纯 Rust OCFS2 0.90 只读读取：支持分配链与位图、内联 / 索引目录、extent 和多叶 refcount、稀疏 / unwritten、reflink 与扩展属性；接入浏览、范围读、哈希、导出、快照及 CLI；活动 slot 和需要日志恢复的卷明确拒绝。
+
+- 新增纯 Rust GFS2 1801 / 1802 只读读取：支持资源组位图、stuffed / exhash 目录、定高指针树、硬链接、稀疏文件、纳秒时间和内外联属性，接入浏览、范围读、哈希、导出、快照及 CLI；检查全部日志，拒绝需要重放的卷。
+
+- 新增纯 Rust BeFS（BeOS / Haiku BFS）读取：复用并加固现有 Rust 代码，支持大小端、四种块大小、多组位图、B+tree、全部 run 寻址层级及内外联属性；接入浏览、范围读、哈希、导出、快照及 CLI 命名流；日志未清空明确拒绝，原生官方镜像及独立系统包用于验证。
+
+- 新增纯 Rust Amiga OFS / FFS（DOS0–7）只读支持：复用现有 Rust 库，支持原生 RDB 多块几何、Latin-1 / 长名称、硬链接与本地 50 Hz 时间，接入浏览、范围读、哈希、导出、自动目录索引及 CLI；dirty 卷和 BADB 重映射明确拒绝。
+
+- 新增纯 Rust ReiserFS 3.5 / 3.6 读取：复用并加固现有 Rust 代码，覆盖两种超级块 / 位图布局、混合键、多层树、硬链接、尾部打包与稀疏块；接入浏览、范围读、哈希、导出及自动目录索引，dirty 卷明确拒绝；Reiser4 仍为独立待支持格式。
+
+- 新增纯 Rust Linux JFS2 读取：复用并加固现有 Rust 代码，支持四种分配块大小、多 IAG、内联 / 外部目录和目录索引、硬链接、长符号链接、EA 分配、稀疏 / 未写入 extent 及纳秒时间；接入浏览、范围读、哈希、导出和自动目录索引，dirty 卷明确拒绝。
+
+- 新增纯 Rust 传统 HFS（Mac OS Standard）读取：复用并加固现有 Rust 解析器，覆盖碎片化 catalog / overflow extents、MacRoman 名称及 data / resource 双分叉；接入浏览、范围读、哈希、导出、自动目录索引和 CLI 命名流；本地日期保留无时区语义。
+
+- 新增纯 Rust Minix V1 / V2 / V3 文件系统读取：覆盖五种目录布局、大小端元数据、位图校验、全部间接层级与多 block zone，接入浏览、范围读、哈希、导出和自动目录索引；与固件 MINIFS 独立显示。
+
+- 新增纯 Rust UDF 1.02–2.01 单物理分区只读浏览、范围读、哈希、导出和索引：复用并加固 lamfold-udf，校验描述符 CRC / 分区引用 / 数据边界，支持 FE / EFE、稀疏区与续链；VAT、sparable 和 Blu-ray metadata partition 等高级布局明确报错。
+
+- 新增 PyO3 Python 读取库 `lovelycarve`，支持只读打开镜像与归档、浏览分区和文件系统、查询文件属性及按范围或文件对象读取字节；不提供案件、分析、搜索、雕刻或文件内容解析接口。
+- 文件列表新增 NTFS 树图视图：按空间占用把当前目录画成嵌套矩形，面积为逻辑大小或文件数，可按距最新写入的时间着色，可计入已删除文件；滚轮朝指针连续放大，指针下的目录填满视图后再滚即进入，缩回原始大小后再滚返回上级，放大时显示更多名称；与列表共用导航、预览和右键菜单。数据由卷索引汇总，硬链接只计一次；CLI 对应 `files size-tree get`。
+- 新增原生只读 QNX4 / QNX6 Power-Safe Rust 读取库：extent 链、大小端、MMI、CRC 代际选择、全部间接层级、长名与范围读，接入浏览 / 哈希 / 导出 / 索引和 CLI，使用 QNX 原生生成镜像及 TAR 独立验证。
+
+- 新增 F2FS 与 EROFS 原生只读浏览、预览、哈希、导出和索引：F2FS 校验 checkpoint / NAT 与 inode 并读取内联 / 间接数据；EROFS 支持未压缩、LZ4、DEFLATE、Zstandard、MicroLZMA 和 chunk 文件，保留时间角色与源字节，未支持的加密 / 压缩或高级布局明确报错。
+
+- 新增独立纯 Rust MINIFS v3 读取库，支持直接浏览裸 MINIFS 与 TP-Link VxWorks 固件中的共享 LZMA 文件块，并复用预览、哈希、导出、范围读取与索引；官方 Archer C6 v4 固件提供逐文件独立校验，旧式 MINIFS 布局暂不支持。
+
+- 支持纯 Rust YAFFS1 512 / 16 NAND 读取，校验分散 tags 与已提供的页正文 ECC，处理两位 serial、删除页、shadow 和硬链接；提供完整、流式和范围读取，独立显示 YAFFS1 类型并保留原始页 / OOB。
+- 支持原生 Rust YAFFS2 NAND 读取，复用并扩展 Rust 头解析；识别大小端 page / spare 和标签，校验已存在的标签 ECC，重建版本、删除、shrink / shadow、硬链接与稀疏文件，支持完整、流式和范围读取，源哈希 / RAW 导出保留 OOB 原字节。
+- 固件 SquashFS 的 XZ / Zstandard 读取改用纯 Rust 解码器，检查完整流、校验和、索引与字典 / 输出上限；无需外部解包程序或 C 解压库。
+- 支持 Netgear Sercomm NAND ZIP 固件，复用 Rust ZIP / 解码库校验封装、CRC、内核与 UBI；以独立逻辑视图浏览解压文件系统，保留源检材身份、压缩来源范围、源哈希和 RAW 导出。
+- 支持 SquashFS 1.0 / 2.0 / 2.1 大小端、旧块表、共享尾片段、长目录、硬链接及精确范围 / 流式读取；旧 LZMA 无结束标记块使用纯 Rust 严格最终状态校验，未记录的特殊文件时间保持未知。
+- 支持裸镜像与固件中的新格式 JFFS2，复用并改造 Rust 库；校验大小端节点与数据 CRC，按版本重建目录和文件片段，支持硬链接、删除标记、空洞与 NONE/ZERO/RTIME/zlib/LZO 范围和流式读取。
+- 支持裸 UBIFS v4/v5、固件中的 UBIFS 与 UBI 内嵌文件树，复用并加固 Rust 节点/索引读取器，校验已提交树与文件数据，支持空洞、硬链接、符号链接、时间戳及 stored/LZO/raw DEFLATE/Zstandard 的范围和流式读取。
+
+- 支持 Buffalo ENC / TRX、TP-Link SafeLoader、U-Boot legacy uImage 组合镜像和 Netgear CHK 固件，校验封装并直接浏览文件系统；源哈希和 RAW 导出保留原始容器字节。SquashFS 增加标准 v3、DD-WRT v3 与 adaptive / LZMA-alone 块的纯 Rust 解码，CramFS v2 和 Linux ROMFS 复用 Rust 库并支持完整、流式与范围读取。
+- 支持 BIN/CUE、ISO/CUE 多文件与混合音频/数据轨，保留轨道、会话、INDEX、间隙及结束标记来源；新增 MODE2/2352 与 CUE MODE2/2336 的 XA Form 1 文件读取，校验子头并拒绝 Form 2 冒充文件系统字节。CUE 源哈希与导出保持原始文件拼接语义，完整 libodraw 对照见光盘格式文档。
+- 支持直接打开 MODE1/2352 原始光盘 BIN，浏览其中的 ISO 9660 / Joliet 文件并预览、哈希和导出；原始镜像字节保持不变，CDFS 普通文件增加直接范围读取并拒绝截断内容。
+- 支持直接读取 UBI 镜像及小米 HDR1 固件中的 UBI 分段，按逻辑块重组命名卷并浏览其中的 SquashFS 文件；修正扩展分段表中第 9 段及后续载荷漏识别的问题。
+- 推送版本标签后自动构建并发布 Windows x64 安装包、独立 CLI 与插件包，附带 SHA-256 校验清单；PR 自动运行前端、Rust 和插件测试。
+- 「设置中心 → 关于」新增 GitHub tags 版本检查；自动检查默认关闭，可手动检查或开启每次启动检查，发现新版时提示并提供标签链接。
+- 新增右键菜单：文件列表的表格空白处（返回上级、刷新、全选、列表范围、隐藏空目录、切换树图、显示列、复制路径、导出此文件夹）与表头（按该列排序、过滤、隐藏该列、恢复默认列），树图瓦片之间的空隙，目录树，以及全局搜索命中、时间线事件、文件恢复条目与分析记录（定位、查看详情，复制名称、路径、偏移、字段值或整行）。菜单可用 ContextMenu 键或 Shift+F10 打开，并支持方向键、子菜单与 Esc。
+- 文件列表支持 Ctrl+单击勾选或取消一行、Shift+单击勾选一段，不弹出预览；鼠标侧键「后退」返回上级。十六进制视图支持 Shift+单击扩展选区。
+- CLI `files text get` 支持分段读取大文本与指定编码：结果附带 `offset` 与 `nextOffset`，用 `--offset <nextOffset>` 读下一段，段末被截断的字符留给下一段；`--encoding gbk` 等 WHATWG 标签跳过自动识别，未指定时后续段沿用文件开头识别出的编码。
+
+### Changed
+
+- 平台识别结论不再用「·」分隔：镜像信息页的平台标签、悬停提示和任务中心的识别结果改用空格连接，备份结论只写一次备份工具；CLI 返回的 `displayPlatformName` 同样改为空格连接，例如「无人机 DJI」。
+
+- CLI 镜像内路径像 shell 一样跟随符号链接：中间的链接总是跟随，读取、哈希、导出、文本、列目录和 `context set` 也跟随末尾的链接，`files get` 仍显示链接本身及 `linkTarget`。绝对目标从链接所在卷（分区、逻辑卷、APFS 卷、btrfs 子卷或容器）的根解析，目标中的 `..` 不越过该卷，最多跟随 40 层；Windows 盘符目标不跟随并说明原因。
+- CLI 参数写法统一：接受位置参数的命令也接受同名选项（如 `files get --path <路径>`），以节点为目标的命令都接受 `--node-id`（`files list` 等原有的 `--parent-id` 仍可用）；列表命令收到位置参数时给出改写成 `--path` 的完整提示。
+- 编码代理调用 CLI 时，错误与结果不完整警告改为标准错误上的一行 JSON（`{"error":…}` / `{"warning":…}`，与 JSONL 会话的字段相同），不再输出带边框的块。
+- CLI 导出目标已存在时说明导出从不覆盖、未写入任何内容；`files export` 用于目录时以 `isDirectory` 失败并给出 `files directories export` 的写法。
+
+- CLI 代理技能支持自带 `bin/` 运行目录，按 skill 自身位置调用程序；新增 `just stage-cli-skill`，将现有 Windows release CLI、运行库与插件整理为可整体复制安装的 skill，刷新时保留旧运行文件。
+- Windows 桌面发布版改为以普通用户权限启动，不再强制弹出管理员授权；读取物理磁盘或采集实时内存时仍需手动以管理员身份运行。
+- 统一左右键：单击选中，双击或 Enter 打开。文件列表与文件恢复页的目录名不再是单击即进入的链接；树图里再次单击已选中的目录不再进入；时间线中 Enter 与双击一样定位文件事件。
+- 右键菜单改为作用于右键的对象：右键未勾选的行只作用于这一行，右键已勾选的行时作用于全部勾选项，菜单顶部写明对象；此前只要存在勾选，右键任意行都作用于勾选项。菜单按打开、导出、分析、复制分组，不适用于该对象的操作不再显示，计算哈希的算法改为子菜单。
+- 十六进制视图右键改为打开复制菜单（十六进制、按编码复制文本、起始偏移、取消选择），右键选区外的字节先选中它；此前右键会直接复制。
+
+- Windows 桌面、CLI 与插件配方默认使用 `lld-link`、单任务编译和单线程链接，release 使用 Thin LTO；保留 Cargo 环境变量覆盖，降低默认构建负载。
+- 界面动效更新：分段控件的滑块和页签下划线在切换时滑到新位置；弹窗、菜单与通知以轻微的弹簧落定；复制成功的对勾先画出、换回前淡出；不定进度条改为匀称的往复扫过；任务中心有任务运行时显示闪烁的状态点；双击详情栏或预览栏的分隔条可恢复默认宽度。动效关闭时以上均直接切换。
+- 界面视觉更新：浅色与深色主题改为带暖调的中性灰与陶土色强调；标题栏与导航共用窗口框架底色，工作区成为嵌在框架里的圆角面板；当前标签页抬起为胶囊；默认按钮改为无边框的浅填充，按下后带轻微回弹；分段控件改为胶囊滑块；弹窗与菜单更圆、去掉分隔线，可滚动的弹窗正文和导航列表在仍有内容的一侧淡出。
+- 配色随陶土色强调调整：警告改为赭金色以免与强调色混淆，信息改为沉稳的蓝，成功改为自然的绿；磁盘布局与分类图表改用偏低饱和的蓝、灰绿、赭金、紫、陶土、青；字标与欢迎页的点改为陶土色。欢迎页导入卡片的插图重绘为线稿：磁盘放在检材托盘中、文件悬在托盘上方，拖入文件时文件落进托盘。
+- CLI 不再把失败或不完整的结果报告为成功：后台任务（命令返回后仍在运行的扫描、索引与插件任务，以及检材登记到案件后自动开始的任务）失败或结束时没有报告结果时，一次性命令在输出结果后以 1 退出；`tasks wait` 返回期间结束的后台任务及其结局，任一失败时以 `tasksFailed` 失败；`sessions close` 报告此前没有被等待的失败。结果不完整（哈希或导出含零填充坏扇区、搜索有文件读不出或达到命中上限、目录导出提前停止、恢复导出有失败文件）时照常输出，但在标准错误显示警告、JSONL 响应附带 `warning`，并以 2 退出；`system get` 列出退出码。
+- CLI 代理技能 `skills/lovelycarve-cli` 按任务导航并按需读取操作流程，覆盖案件与会话、文件定位、逐卷分页、JSONL、时区、搜索、RAID/LVM、解锁、恢复、插件、时间线及哈希导出；说明 Windows shell 路径转换、嵌套 JSON 字段、链接目标及文本编码处理，提供独立 LUKS 明文浏览与导出示例，并在依赖分析或导出前检查准备结果。`references/commands.md` 从命令目录生成（`just update-cli-skill`），与命令不一致时测试失败；手写命令示例也自动校验。编码代理调用帮助时的说明指向该技能。
+
+### Fixed
+
+- 修复 SQLite 原类型视图的搜索误报无匹配。搜索栏会统计和高亮当前页的单元格匹配，并支持逐项定位。
+
+- CLI 时区探测支持检材内 `/etc`、`/usr` 等目录的相对、绝对与链式符号链接，保持原始 TZif 优先和时区来源；越界、断链及循环链接明确报告，绝不读取主机同名配置。
+- 修复检材平台误判：目录、压缩包、Docker 等逻辑检材的根目录已识别出 Linux 或 DJI 无人机系统时，不再因 `var/backups`、AOSP 自带的 `SharedStorageBackup` 等含 backup 的条目名被改判为 Android 备份；解锁后的 BitLocker 卷按 NTFS 规则识别 Windows，解锁后的 LUKS、FileVault 与 VeraCrypt 分区按其中的明文文件系统识别，此前解锁后重新识别仍看不到其中的系统。
+
+- 修复目录与压缩包检材的插件来源跳转误报“源文件不存在”：按检材内部根目录解析来源路径，保留完整导航层级，并支持源检材缺失时从已有索引定位。
+
+- 修复 Windows 独立预览窗口重复初始化 WebView2 环境导致的创建失败；复用主窗口环境，串行创建并在失败时清理监听，支持重新打开。
+
+- 修复文本预览与 CLI `files text get` 把 GBK 等多字节编码误判为 windows-1252：只读取了文件开头一段时，段末被截断的字符不再被当作编码错误，文本末尾也不再出现替换字符。
+- 修复 Git Bash / MSYS2 把以 `/` 开头的镜像内路径改写成主机路径（如 `C:/Program Files/Git/分区1/…`）后 CLI 找不到路径：自动还原为原本输入的路径，无法还原时说明原因及 `MSYS2_ARG_CONV_EXCL` 设置；找不到路径时写明所在目录与缺少的名称。
+- 修复常驻会话后台进程意外退出后残留的记录让后续命令反复报 `sessionUnavailable`：发现进程已退出的命令清理记录并以 `sessionExited` 说明如何重新启动，`sessions close` 对这类会话直接成功，`sessions list` 不再反复列出。
+- 修复 Windows LLD 链接时重复合并 UAC 片段导致 CLI 无法启动的问题；继续由显式清单声明 `asInvoker`。
+- 修复 CLI 的几处静默失败：在终端拒绝删除确认时以 0 退出，现以 1 退出；`tasks get`、`analysis records get`、`analysis runs get` 与 `indexes files lookup` 找不到对象时显示 `✓ 已读取` 而没有输出，现以 `notFound` 失败，其他查询为空时输出 `null`；`tasks cancel` 对不存在或已结束的任务也报告成功，现报错并在成功时返回 `cancelling` / `cancelled`；`context get` 读取当前检材信息失败时不再省略原因。
+- 修复大目录下左侧目录树展开和滚动卡顿：按可见范围渲染和补齐子项计数，避免逐个预读所有子目录。
+- 修复已删除 NTFS 目录缺少 `$INDEX_ROOT` 时无法展开的问题；删除子项从 MFT 快照读取，现存目录的索引错误仍明确报告。
+- 修复 release 中滑块、折叠面板等脚本动效几乎瞬间完成的问题：正确将生产 CSS 压缩后的秒单位换算为毫秒。
+
+### Removed
+
+- **破坏性变更**：移除 `lovelycarve-cli` 的 `cli search` 命令搜索、隐藏的 MCP 工具定义命令 `tools`，以及 `docs search` / `docs list` / `docs get` 和程序内嵌的文档；编码代理改用随包技能查找命令与用法，人工使用 `--help`、`schema` 与 [CLI 手册](docs/CLI.md)。
+- 文件列表筛选条移除「文件类型」菜单：不再按文件类别多选过滤，也不再统计各类数量。按扩展名或类型筛选改用「扩展名」「类型」列的漏斗；文件恢复页的类别筛选不变。
+- 移除樱花色主题，只保留浅色和深色；此前选择樱花色的设置改为按系统外观使用浅色或深色。
+
+## [1.2.0] - 2026-10-20
+
+### Added
+
+- 不完整 RAW 可通过 CLI `images open --raw-read-mode force` 或 IPC 显式强行读取：从所选分片拼接连续前缀，容忍短读并对临时设备错误重试一次；完全越界时明确补零并保留坏区审计，默认严格打开与哈希、导出完整性检查保持生效。
+- `lovelycarve-cli docs search` 离线搜索随程序附带的使用指南、CLI 手册与格式专题，`docs get` / `docs list` 阅读与列出页面；隐藏命令 `tools` 把全部命令输出为 MCP 工具定义，便于 MCP 服务器包装命令行。
+- RAID 重组补齐 Linux md 的级别与元数据：识别 0.90 与 1.0（超级块在盘尾）、1.1、1.2 元数据，组装 linear、RAID1、RAID4、RAID6（全部 md 布局，最多缺两块盘时按 P / Q 校验重建）与 RAID10（near / far / offset），RAID5 增加首盘 / 末盘校验布局，RAID0 支持大小不同的成员盘。超级块的校验和与位置会被核对，按事件计数排除陈旧成员与仍在重建的成员，同一块盘重复加载只读一份。
+- 缺盘的 md 阵列可以降级重组：md 已把缺失成员记为故障时自动按校验或剩余镜像重组；元数据仍登记的缺盘在 RAID 卡片中点「降级重组」确认（CLI 为 `raid detect --degraded-sets`）。
+- md 阵列上的 LVM 卷组随阵列识别，跨多个物理卷的线性逻辑卷（包括 NAS 由多组阵列拼成的存储空间和跨磁盘的卷组）组装为独立的「逻辑卷」检材。
+- 手动重组支持 linear、RAID0/1/4/5/6/10、全部校验布局与 RAID10 副本布局，可以用「缺盘列」代替没有镜像的成员盘，或把某列标为不读取，按校验或镜像重建。
+- 识别并重组固件 RAID：Intel RST / VROC 的 IMSM 卷（RAID0/1/5/10，同一组盘上的多个卷分别重组）与 Dell PERC、LSI MegaRAID、Adaptec 控制器及 mdadm `ddf` 容器的 SNIA DDF 虚拟盘（RAID0/1/4/5/6/10、RAID1E 与串联）。元数据的校验和与 CRC 会被核对，按元数据的更新序号排除陈旧成员，故障、缺失与重建中的成员沿用 md 的降级规则；正在迁移或重构的卷与不支持的级别只列出并说明原因。IMSM 只以硬盘序列号标识成员，成员按 E01 记录的序列号或唯一的磁盘大小排序，两者都没有时除 RAID1 外标为「成员顺序未知」，按检测说明给出的几何手动重组。
+- 插件包：「设置 → 插件」与 CLI `plugins create` / `plugins delete` 安装、更新与卸载 `.lcpkg` 插件包，内置插件不可替换；插件包带记录结构（`schema.json`）与语言包，界面按当前语言显示插件的名称、分类、选项与列名；加载失败的插件包连同原因列出。
+- 系统级插件分析：识别检材上的操作系统，并按 `/etc/fstab`（UUID、LABEL、PARTUUID、LVM 逻辑卷、Btrfs 子卷）与 Windows 盘符把系统的各个卷组装成一棵目录树，分析器在每个系统上分别运行，独立的 `/home` 等分区随系统一起分析。快速分析可选择要分析的系统，CLI 用 `plugins systems list` 列出系统、`plugins tasks create --system-id` 指定目标。检材级分析器按声明的输入在检材全部卷中取文件，文件级分析器声明了选项时在提交前填写。
+- 分析结果的表格按插件声明的字段类型显示（大小、时长、枚举、列表等）并可点击列头排序，CLI `analysis records list` 支持 `--sort` / `--descending`；记录详情列出全部字段和每个来源及其位置说明（如行号）；新增「运行信息」（CLI `analysis runs get`）查看一次运行的输入文件、选项、画像事实、告警与读不出而以零填充的源字节。
+- 插件可以发布画像事实（时区、主机名、用户等），后续分析在启动时获得这些事实；声明了所需事实的自动分析器在事实发布后于同一系统上自动运行。
+
+### Changed
+
+- CLI 对管道与编码代理输出紧凑 JSON，列表支持 `--fields` 与前置分页元数据，代理文件分页默认 50 条；合并列表时区来源、仅在变化时保留原始时间，精简帮助错误与默认诊断，修正字节进度及退出快照提示，并随包提供代理技能。
+
+- 分析结果支持插件声明的纵向属性视图，并按插件和记录类型保存属性／表格视图偏好；表格直接显示可见字段，全部字段和来源仍可在详情查看。Linuxinfo 的系统信息与时区默认使用属性视图。
+- 分析结果页重新设计。目录按结果分类分节，每次运行以分析器和目标两行为标题，点击标题打开运行信息，左侧按钮折叠；记录数右对齐，没有记录的类型变淡，从别处选中的结果会在目录中展开并滚动到可见处。运行信息改为概览页：记录数、记录类型、输入文件、告警与耗时，各记录类型的产出条形图（点击打开该类型），告警与输入文件列表，运行参数与技术信息；读不出而补零的源字节在页首提示，旧版结果也能查看产出。表格按字段类型定列宽，文本列分配剩余宽度；时间戳显示为 `2024-01-02 03:04:05 UTC` 或 `UTC+08:00`，保留原始精度，未记录时区的时间不标时区；缺失值变淡。记录详情先列字段再列来源，可切换上一条 / 下一条，表格行可用方向键移动；分页增加第一页与最后一页。
+- 文件列表重新设计。地址栏只放目录树开关、上一级、面包屑、刷新、搜索与预览开关，深层路径先省略中间各级，当前目录始终可见。表格上方新增筛选条：「当前目录 / 所有子目录」切换列表范围，递归列出时名称后淡显所在子目录；「文件类型」改为带数量的多选菜单；每个生效的列条件与「隐藏空目录」都显示为可修改、可移除的标签。导出移到筛选条右侧，作用于勾选项，未勾选时作用于选中行；页脚改为单行，只放条目数、勾选统计与卷快照状态，按条件查询的总数标为「符合条件」。表头漏斗平时隐藏，标签列隐藏时标签显示在名称旁。按条件筛空的目录显示「没有符合条件的条目」并可一键清除，不再误报为空目录；目录读取失败在列表中给出原因与重试。文件恢复页的地址栏同步改用新样式。
+- **破坏性变更**：插件协议升级为 LPP v2，只加载 v2 插件包，LPP v1 插件需用 SDK 0.2 重新构建：清单改为 `[[analyzer]]` 声明作用域、平台、输入、选项与画像事实，分析结果是按记录结构校验的类型化记录，插件经按运行的只读视图与文件句柄读取检材。插件一律在 `lc-plugin-host` 进程中运行，进程内加载方式已移除；`lc-plugin-host --describe` 导出库的分析器与记录结构，`just build-plugins` 写出 `schema.json`，`just pack-plugins` 生成 `.lcpkg`。
+- 插件结果改存检材的 `records.db`，每种记录类型一张类型化表；同一（分析器、检材、目标）的新结果成功发布后替换上一次结果，重新分析不再先删除旧结果。带时区的时间戳按插件声明的时间线角色进入时间线，时区未知的本地时间只在记录表格中显示与排序。旧案件里的插件结果标注「旧版」只读显示，不迁移、不改写。
+- 插件任务不能暂停：取消即结束执行，重新分析从头开始，旧案件中暂停的任务可以开始或取消；同一作业已有未结束的任务时不重复创建。文件恢复扫描的暂停与继续不变。
+- 任务中心改为后端统一列出插件任务与内置任务：内置任务由后台自己报告对象、阶段、进度、计数与结局，不再由界面推断；新增镜像哈希、目录导出、恢复文件导出与 BitLocker 解密镜像导出的任务记录，文件系统加载与索引合为每卷一条。CLI `tasks list` / `get` / `cancel` 覆盖插件任务（id 为 `plugin:<任务 id>`），`tasks list` 可按 `--image-id` 过滤；`plugins tasks list` 与 `sched-task-event` 事件已移除，改用 `tasks list` 与 `task-entry` 事件。
+- `linuxinfo` 2.0.0：在每个识别出的 Linux 系统上运行，读取 fstab 挂载的分区，结果为带英文标签的类型化记录，并发布时区、主机名与用户画像事实；`items` 选项可选择子项。
+
+- 源盘哈希、文件摘要与搜索结果回填的 MD5 使用 `fast-md5`，通过内联汇编加快单流计算，不增加运行时 DLL；摘要格式与 E01 采集哈希核对方式不变。
+- E01 / Ex01 的大范围读取采用最多四个任务并行解码，绕过解码块缓存，减少源盘哈希与 RAW 导出的解压等待，并保留小范围元数据读取缓存及块校验。
+- 全局搜索的关键词多编码变体在编译时合并，原样与纯 ASCII 忽略大小写各扫描一次，减少重复遍历与缓冲区拷贝；保留编码优先级、重叠命中、跨块搜索和每文件命中上限。
+
+- md 阵列重组后按分区表与卷探测识别其内容，XFS、NTFS、FAT、LVM、LUKS 与带分区表的阵列不再因只认 ext4 / Btrfs 而无法打开；未识别出结构的阵列也会注册，可做十六进制查看、文件恢复与导出。阵列大小按 md 记录的每盘使用大小与整块计算，不再把成员盘末尾不足一块的部分算入容量。
+- RAID 卡片的成员计数只计正在读取的成员，并标注陈旧、重建中、备用、故障与重复加载；条带示意按 md 的实际布局绘制 RAID1、RAID4、RAID6 与 RAID10。同时属于多个阵列的磁盘重新打开时进入容量最大的阵列。
+
+- `lovelycarve-cli` 的帮助改为 yargs 版式：用法与说明之后是命令、位置参数、全局选项、选项与示例表格，右侧标注类型、必填、可选值与默认值，按终端宽度换行。提问与进度改为 clack 样式，进度标签只写动作并显示秒数，提问时取消以 130 退出且不再另显示错误块；后端命令失败显示为带错误代码与 IPC 名称的「后端错误」块；JSON 结果保留后端字段顺序。数组选项可在一个选项后列出多个值，`--body` 可以给出必填的位置参数，`.env.local` 覆盖 `.env`，检材取自环境变量或文件时提示来源，缺少检材时列出全部指定方式。
+
+- **破坏性变更**：`lovelycarve-cli` 命令行重新设计。命令统一为 `<集合>… <动词>`（如 `images open`、`files read`、`carve scans create`），标准输出只放 JSON 或原始字节，提示与错误写标准错误；新增 `cli search` 按意图查找命令、`schema` 查看后端请求、`complete` 生成 shell 补全；所有命令支持 `--dry-run` 与 `--body`，删除类命令需确认或 `--force`，缺少的值在终端中提问，密码遮盖输入。交互浏览改为 `lovelycarve-cli shell`，JSONL 会话协议升级到 v2（请求写命令路径，参数以 API 名称为键）。原 IPC 名称命令（`image_load`、`fs_read_range` 等）、`call`、`run`、`commands`、`capabilities` 和 `ls`、`cat`、`grep` 等快捷词不再可用，输入旧名称时会提示对应的新命令。
+- `lovelycarve-cli` 成为不链接 Tauri 的独立程序，不包含 WebView、GTK 或桌面运行时；Windows `asInvoker` 清单在链接时嵌入。桌面构建通过新的 `desktop` Cargo 特性启用 Tauri。
+- 界面文案按前端文案规范统一标点、空格与括号，中英文按 `docs/FRONTEND.md` 的取证术语表一一对应：数据源统一称「检材」（evidence），「原镜像」「原始镜像」改为「源镜像」（source image），搜索结果统一称「命中」（hit），页签统一称「标签页」，「磁盘间隙」改为「分区间隙」，进行中的任务统一用「取消」，「载入」改为「加载」，RAID 缺盘统一为「缺失」，坏区补零统一为「补零」，雕刻结果目录改名「签名雕刻」，「遗失分区」改为「丢失分区」，E01 采集记录的「取证员」改为「检验人」；「啃不动」「落库」「持久化」「补页」等口语和开发用语改为通俗说法。
+- 后端返回的错误与任务提示按同一术语表和标点规范统一：「原镜像」改为「源镜像」，「文件夹证据」改为「文件夹检材」，「合成零字节」改为「补零字节」，文件恢复的扫描范围改称「整个镜像」「分区间隙」，任务调度提示里的「worker」改为「执行器」，「raw key」改为「原始密钥」，中文提示统一使用全角冒号；错误码判定保持不变。离线索引会话的分区根目录改名为「分区1」，与在线会话的文件树和 CLI 路径一致。
+
+### Fixed
+
+- 卷导航名称中的空格、括号、`·` 等分隔符统一为 `_`，覆盖分区、RAID/LVM、APFS、Btrfs 子卷、Docker、卷影副本和目录／归档根，便于脚本使用；CLI 路径首段也支持根节点 ID（如 `/part:0/Users`）来区分重名卷，真实文件名、原始卷标元数据与证据身份保持不变。
+- CLI 与共享后端的文件、目录 ZIP、命名数据流和时间线／搜索导出不再覆盖已有主机文件；目录树要求新目标目录，单文件／数据流导出失败不留半成品。文件哈希新增本次读取的坏区与补零审计，桌面提示并拒绝将含补零摘要保存为普通哈希；`files read` 在单次、JSONL 与常驻会话遇到读故障时明确失败，避免脚本把补零当成真实源数据。
+- CLI 可用 `context set --node-id`、shell／常驻连接中的 `cd --node-id` 进入同名卷；无案件时也可按节点 ID 查询属性。递归列表返回完整检材绝对路径，NTFS、FAT/exFAT、HFS+ 与不区分大小写的 APFS 路径支持唯一的大小写回退匹配。
+- 插件任务按运行 ID 精确删除结果，避免删除历史任务时误删后续分析或其他插件的结果；取消、超时及关闭案件与结果发布互斥。分页与 CSV 导出固定运行 ID，翻页期间新发布的结果不会混入。
+- 插件批量读取预留协议帧开销，插件文件系统补齐随机读取及短读错误。
+
+- E01、VMDK、VHD/VHDX、PMFX 容错读取失败时按扇区隔离坏区，只对不可读扇区补零并报告；哈希、RAW 导出与缓存读取保留坏区前后的可读数据，不再把大块请求开头至坏区之间的正常数据一并替换为零，并避免反复读取、解码整个剩余范围。
+- Windows 物理磁盘检材读取设备报告的硬盘序列号，用于 Intel IMSM 成员定位；ATA 字节交换的序列号也须唯一匹配元数据记录，避免同容量成员盘因缺少 E01 采集信息而只能手动重组。查询失败或序列号不明确时仍按已有规则处理，不猜测成员顺序。
+- 重新打开案件时不再解码 ZIP 检材里的全部小米 / Android 备份：首次展开后，备份目录清单保存在案件的检材缓存中，再次打开直接恢复目录，读取某个备份内的文件时才解码该备份。打开含大量备份的手机 ZIP 不再长时间占满 CPU 与磁盘、写出与备份等量的临时 TAR，切换或关闭案件也不再等待删除这些临时文件。
+- 重组镜像读到成员盘的截断或越界位置时明确报错，不再返回截短的数据；降级重建不再把缺少的对端数据当作零参与校验运算。
+- 重组的 md 阵列、固件 RAID 卷与跨物理卷的逻辑卷读到成员检材的坏扇区时，源盘哈希、RAW 导出与文件导出结果的 `bad_regions`、`synthetic_bytes`、`read_faults_detected` 按阵列偏移报告补零的字节，严格读取策略也会因此终止；此前源盘哈希不计入这些字节，导出结果则按成员盘的偏移报告。RAID1、RAID10 改从其他副本读取成员补零的字节，RAID4/5/6 按校验重建，冗余也无法提供的字节才保持为零并上报；降级重建不再用补零的字节参与校验运算。
+- 无 RAID 元数据的阵列（如 mdadm 头被清空的 NAS 成员盘）自动检测时，每块成员盘的奇偶校验、占用与数据偏移采样只读取一次，各成员并行读取，不再为每项检查和每个候选成员组合重复读取、解压同一批数据块。重新打开含此类阵列的案件时，打开标签页前的 RAID 检测不再等待数秒；检测出的阵列、重组参数和镜像 ID 不变。
+- 解码备份、`.tar.gz` 与 DMG 得到的临时文件改为关闭即删除，程序退出或异常结束时由系统清理；此前桌面程序退出后它们会留在系统临时目录，每次最多与已解码内容等量。
+- 英文界面不再夹带中文括号、冒号、引号与顿号（列表改用英文逗号分隔），错误提示的冒号后补上空格；锁定 / 解锁案件、构建 / 取消快照失败等提示不再因拼接显示「Failed to Lock case」一类的大小写与语序错误，从案件移除检材的确认按钮不再显示「Unmount」。
+
+### Removed
+
+- 直接分析单个文件的 `plugin_analyze_file`、`plugin_analysis_list` 与暂停插件任务的 `sched_task_pause` 命令，以及对应的 CLI `plugins analyses create`、`plugins analyses list`、`plugins tasks pause`；文件分析改为创建任务（文件列表右键「插件分析任务…」或 `plugins tasks create --node-id`）。
+
+## [1.1.1] - 2026-10-16
+
+### Added
+
+- ZIP 检材中的小米 `.bak` 备份自动展开为只读目录，可直接浏览、预览和导出应用数据；原 ZIP 保持不变，无法解析或需要密码的备份保留为原始文件。
+- 支持直接打开 Android `.ab` 与小米 `.bak` 备份，按 Android Backup 1–5 解析未压缩、zlib / GZIP 载荷，保留原始容器字节；ZIP / 文件夹内的 `.ab` 也会自动展开，加密备份明确拒绝。
+
+- 插件日志（SDK 的 `Context::log`）按插件落盘到软件 exe 目录下的 `logs/plugins/<插件 id>.log`，单文件超过 8 MiB 自动轮转并保留一代；写入由独立线程与有界队列完成，不阻塞插件调用，也不受默认 `warn` 过滤影响。
+
+- 文件恢复：读取 FAT12/16/32、NTFS、exFAT 的删除记录，按引导扇区和残留 `$MFT` 重建遗失分区，并还原回收站中文件的原名和路径；导出时按卷和原目录结构写出文件，附带 SHA-256 与 JSONL 来源报告。
+
+- 界面支持简体中文与英文，可在设置中即时切换并保存偏好，主窗口与独立预览窗口同步语言。
+
+- 新增纯 Rust Parallels PHDI 读取器，支持 v2 Plain / Sparse / Split 与差分父链，保留随机读取和完整性校验。
+
+- RAW / 解密镜像导出接入任务中心，显示目标路径、进度和终态，并共用进度提示的取消入口。
+
+- CLI JSONL 会话支持 `session --jobs N` 并发查询，保留案件／检材切换屏障与结果引用依赖；命令清单公开并发能力，响应按 ID 关联，便于 AI agent 自动化。
+
+- QCOW 读取补齐 v1、DEFLATE 压缩、RAW/QCOW 差分父链和 legacy AES 密码/原始密钥入口，提供 libqcow 全部 42 API 对照；修复零簇覆盖父镜像、现代 v3 头部与读取边界校验。
+
+- 新增参照 libsmraw 重写的纯 Rust `smraw` vendor 库，支持单文件/分段 RAW 读写；应用和 CLI 从首段读取完整镜像，检查编号缺段与所有源段的稳定性，提供 72 个公开 API 对照与格式限制说明。
+
+### Changed
+
+- 「文件雕刻」并入「工具 → 文件恢复」：一次扫描可同时进行文件系统恢复与签名雕刻，新增扇区范围；结果像文件列表一样按目录树、地址栏和文件表浏览，雕刻结果按格式归入「签名恢复」文件夹，可一并勾选恢复。CLI 通过 `carve_start` 的 `filesystems` / `signatures` 选项、`carve_filesystem_results` 与 `carve_recover` 的 `file_ids` 使用同一流程。
+
+### Fixed
+
+- 修复 NTFS AF_UNIX 重解析点的尾部字节触发长度误报，以及扫描已删除记录时把无关属性链的过期引用或已释放属性表误报为重解析错误；保留实际重解析引用和内容读取的完整性校验。
+
+- 逻辑归档与手机备份的信息页不再显示 RAID 检测卡片；平台识别标签合并重复的厂商和“备份”文字，完整识别描述保留在悬停提示中。
+
+- 已展开的小米 / Android 备份显示为可进入的文件夹，名称隐藏 `.bak` / `.ab` 后缀；打开旧案件时自动重建不兼容的目录索引，避免仍按原文件预览时报“directory”。
+
+- 压缩检材先打开证据标签页，后台解包完成后加载内容，期间可切换标签和操作案件；任务中心显示解压进度并支持取消，关闭标签或切换案件会取消在途加载，避免旧结果进入新案件。开发版优化 DEFLATE / CRC 路径，缩短小米备份解包等待。
+
+- 修复 EWF 回归测试的三项错误断言与合成镜像布局，补充压缩块精确长度、不可压缩数据及 eager/lazy 读取一致性验证。
+
+- E01 / Ex01 镜像信息的采集与系统时间按头部编码格式化，区分未记录时区的采集机本地时间与 Unix 秒；保留原始值和解析失败回退，并补齐 Ex01 的 `at` / `tt` 日期字段。
+
+- 修复 RAW / 解密镜像导出完成、失败或后端确认取消后任务状态未释放，导致同一镜像导出按钮持续置灰、无法重试的问题。
+
+- TAR.GZ / TGZ、Docker / OCI 压缩层与小米备份的 GZIP 读取接入纯 Rust `gzipf`，完整读取拼接成员并校验全部尾部，避免忽略后续成员或损坏校验值；GZIP 备份提取前先验证完整压缩流。
+
+- FAT 删除项的元数据地址保留短目录项的绝对镜像偏移，支持非零分区基址、固定根目录和不连续的目录簇链。
+
+- 修复 NTFS LZNT1 解压把簇尾对齐填充误当作下一数据块的问题。
+
+## [1.1.0] - 2026-10-13
+
+补齐分区表、卷管理与加密容器的读取能力，接入 FileVault 2 并扩展 APFS 与 HFS+ 读取，与 libyal 系列库逐项对照并修正一批取证读取问题，同时重新整理 README 与文档。
+
+### Added
+
+- 普通磁盘与 RAID 重组镜像顶部提供原始 RAW 导出；已解锁的 LUKS、VeraCrypt 和 BitLocker 分区按明文导出，保留整盘布局与大小。
+- BitLocker 支持 AES-256 Diffuser（8001）、Vista、Used Disk Space Only（EOW）与 4 KiB 扇区卷，新增明文密钥、BEK 启动密钥、FVEK / TWEAK 与 VMK 直接解锁，并提供 libbde 能力对照。
+- XFS 读取覆盖格式 1–5、目录 v1–v3 的全部布局、扩展属性、BIGTIME 与 metadata UUID，支持文件范围读取与来源区间映射，并记录 libfsxfs 全部 82 个公开 API 的能力对照。
+- 补齐 VSS 原始块/存储区间枚举、签名检查与有界 seek/read，增加只读检查入口和 libvshadow 全部 48 个公开 API 的能力对照。
+- 补齐 LVM2 的 VG/PV/LV/segment/stripe 元数据与原始 LV 范围读取，支持单 PV 碎片多段卷，提供 libvslvm 全部 69 个公开 API 的能力对照。
+- 补齐 GPT 原始槽位、类型/唯一 GUID、属性、UTF-16 名称、主备头校验与有界 seek/read，增加分区探针 `--gpt` 及 libvsgpt 全部 42 个公开 API 对照。
+- 补齐 MBR/EBR 原始类型、启动标志、CHS、槽位来源和有边界限制的 seek/read 接口，提供分区探针 `--mbr` 及 libvsmbr 全部 38 个公开 API 的能力对照。
+- 补齐 LUKS 的 AES-CBC/ECB、Blowfish、Serpent、ARC4、更多 IV 和 SHA-224/384，提供 LUKS1/2 主密钥解锁入口及 libluksde 全部 36 个公开 API 的能力对照。
+- 补齐 FAT/exFAT 文件范围读取、原始属性与目录项偏移等后端元数据接口，并记录 libfsfat 全部 53 个公开 API 的能力对照。
+- 补齐 ext2/3/4 内联文件与目录、EA-inode 扩展属性、旧式目录和 meta_bg 读取，并记录完整 libfsext 能力对照。
+- ext 读者提供卷挂载历史、feature masks、UID/GID、链接数和设备编号等元数据 API。
+- 接入 filevault-core / filevault-forensic：CoreStorage 识别、逻辑卷库存与审计、密码/恢复/VMK 解锁、受检多 extent / 主备元数据，复用原分区解密视图；完整 libfvde 对照见 docs/formats/FILEVAULT.md。
+- HFS+ / HFSX 对照 libfshfs：完整 data/resource/attribute 映射、固定 Unicode 规则、硬链接、压缩/随机读取和元数据边界；完整 95 API 对照见 docs/formats/HFS.md。
+- APFS 提供直接范围读取与原检材数据区间，补齐容器/卷身份、OID 文件访问、可寻址扩展属性与原生快照元数据 API，并记录 libfsapfs 全部 110 个公开 API 的能力对照；APFS 原生加密解锁和历史快照浏览仍未实现。
+
+### Changed
+
+- 插件 SDK、隔离宿主与 `linuxinfo` 改由独立的 [LovelyCarve-Plugins](https://github.com/LovelyTeams/LovelyCarve-Plugins) 子模块维护；源码构建需递归克隆或运行 `just bootstrap` 初始化子模块。
+- RAID 自动重组的标签页与页面标题统一为「RAID N 重组镜像」，完整会话标识移至可复制的详情字段。
+- 重写 README 并加入界面截图；整理文档，格式与读取器专题移至 `docs/formats/`。
+
+### Fixed
+
+- VSS 损坏或循环 catalog 明确报错，存储头完整读取并校验；异常 catalog 卷尺寸按 NTFS 主备几何恢复可读范围，保留原始值，长副本链不再依赖递归栈。
+- LVM2 验证标签、元数据头及文本 CRC，拼接活动环形缓冲回绕并读取远端备份；修复同大小 PV 身份、4Kn 的固定 512 字节单位、首段截断与未使用 PE 判定，跨镜像缺失/冲突成员不再组装为残缺 LV。
+- GPT 优先采用头与数组 CRC 完整的副本，磁盘 GUID 与分区保持同一来源；修复 1024/2048/4096 字节几何、单扇区分区和完整范围校验，超过 256 个可浏览分区明确报错，避免 ID 回绕。
+- 修复 Vite 8 干净安装后前端构建因缺少 esbuild 失败，改用内置 Oxc 压缩器。
+- Windows 默认构建恢复 MSVC 链接器，移除对额外 LLVM 链接器的强制要求；完整 QR/OCR 构建仍需 libclang。
+- 修复含主数据分区的 1024/2048/4096 字节扇区 MBR 几何识别，支持多个扩展入口及分叉 EBR，并校验完整分区/链接范围；循环、损坏和遍历限额提供告警，分区 ID 不再回绕。
+- LUKS 密钥材料按扇区补齐，LUKS2 密钥槽支持与卷主密钥不同的长度；解密 seek 溢出、无效 PBKDF2 轮数和不合法的算法组合明确报错。
+- 修复 exFAT 文件初始化尾部、负时区与 10 毫秒时间精度、跨目录槽位 UTF-16 名称及连续子目录的删除项扫描。
+- FAT 按数据簇数识别格式并支持大逻辑扇区；FAT/exFAT 读取校验损坏簇链与短读，保留同名删除记录，并避免把未知本地时区标成 UTC。
+- ext 文件范围与流式读取统一完整间接块映射，未写入 extent 读零，越过卷边界或来源短读时报错。
+- 修复 ext signed/扩展 epoch/纳秒时间戳及 birth 投影、32768-block extent 长度、64 KiB 目录记录和旧组描述符 CRC16 校验。
+- 安装包、便携包与 CLI 包随附 VC++ 运行库（`vcruntime140.dll`、`vcruntime140_1.dll`、`msvcp140.dll`、`msvcp140_1.dll`），未安装 Visual C++ 运行库的电脑也能启动主程序与 CLI、加载 OpenSSL 并启动插件宿主。
+- APFS 对象映射遵守检查点/卷事务上限与删除记录；完整、流式与范围读取统一校验，正确处理显式空洞，并拒绝缺失尾部、重叠、溢出、截断与越过容器的数据。
+- APFS / HFS+ 共享压缩解码器支持 LZFSE 的原样存储块，并校验 RAW resource block 标记与偏移表边界，避免将损坏数据当作文件正文。
+- APFS 支持两类目录键及卷内大小写/Unicode 规范化查找；独立 APFS 分区镜像可识别，更大 superblock 按完整块校验，目录索引保留压缩文件逻辑长度和符号链接目标。
+
+## [1.0.0] - 2026-10-12
+
+首次公开源码发布，对应 Git 标签 `v1.0.0`，采用 AGPL-3.0-only 许可证。桌面开发与发布配方面向 Windows x64。
+当前案件格式不兼容早期开发版的 `.carve` 案件，需要新建案件。
+
+### Added
+
+- 中文桌面工作区，提供浅色、深色、樱花色主题及可配置的界面动画。
+- 案件创建、打开与最近案件记录，支持多检材登记、文件标签和操作审计。
+- 卷目录快照、文件索引及分析结果持久化；原镜像缺失时，可通过已验证的索引浏览目录和元数据。
+- RAW、E01/EWF、VMDK、VHD/VHDX、QCOW2、VDI、DMG、AD1 镜像及 Windows 物理磁盘的只读访问。
+- 文件夹、归档与 iOS 本地备份检材，支持 Docker/OCI 镜像及磁盘中 Docker 容器的合并文件视图。
+- GPT、MBR/EBR、APM、BSD 分区识别，LVM 逻辑卷浏览，以及 mdadm 成员检测与 RAID0/RAID5 重组。
+- NTFS、Ext4、FAT16/32、exFAT、APFS、HFS+/HFSX、Btrfs、ZFS、XFS、UFS/UFS2、SquashFS、ReFS 文件系统读取。
+- NTFS 命名流、LZNT1/WOF 压缩文件读取，以及 ReFS 文件快照流浏览。
+- BitLocker、LUKS、VeraCrypt 和加密 iOS 本地备份解锁，建立按需读取的只读解密视图。
+- NTFS 卷影副本枚举与只读历史会话，可浏览快照时刻的文件内容。
+- 目录树、分页文件列表、排序与筛选，按文件系统能力展示删除项、未分配空间、符号链接及元数据节点。
+- 文本、Hex、图片、音视频、PDF、办公文档及归档等原类型预览；文件预览可拆出为独立窗口并重新停靠。
+- SQLite、Realm 数据库与 PE、ELF、Mach-O、GGUF 等结构化预览，以及 SQLite 删除记录恢复。
+- 镜像与文件的 MD5、SHA-1、SHA-256、SM3 校验，文件、目录、ZIP、RAW 镜像及解密镜像导出。
+- 多编码关键词与正则全局搜索，支持范围筛选、任务历史、分页命中、源文件定位及 CSV 导出。
+- 文件修改时间、插件事件与 NTFS USN 日志的时间线投影，提供热力图、趋势图、筛选和导出；可查看 NTFS USN 与 Ext4 日志。
+- 图片、音频、归档、PDF、SQLite 等格式的结构化文件雕刻，支持暂停、继续、取消、结果恢复及 SHA-256/DFXML 输出。
+- LPP 动态库插件接口与独立进程宿主，内置 `linuxinfo`，分析 Linux 系统、用户、登录、网络、服务、软件与定时任务等信息。
+- 任务中心统一展示分析与后台任务的进度、控制操作和错误，分析结果支持分页、详情、源文件定位与 CSV 导出。
+- BCP 索引与字段说明、按数据集分类的分页浏览、当前页筛选及来源文件查看。
+- 独立 `lovelycarve-cli`，支持交互式证据浏览、哈希、导出、分析命令及 JSONL 自动化会话。
+- Windows Dokany 只读挂载，可将支持的卷与 Docker 合并视图挂载为盘符或文件夹。
+- 可选二维码识别与 OCR 构建；默认轻量构建关闭这些功能，完整构建通过 `*-full` 配方启用。
+- 源码构建、Windows 安装包与便携包、CLI 和插件的本地打包配方，以及使用、开发、接口和第三方来源说明。
+
+[Unreleased]: https://github.com/LovelyTeams/LovelyCarve/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/LovelyTeams/LovelyCarve/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/LovelyTeams/LovelyCarve/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/LovelyTeams/LovelyCarve/compare/v1.1.1...v1.2.0
+[1.1.1]: https://github.com/LovelyTeams/LovelyCarve/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/LovelyTeams/LovelyCarve/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/LovelyTeams/LovelyCarve/releases/tag/v1.0.0

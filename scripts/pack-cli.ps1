@@ -1,0 +1,104 @@
+# Stage a CLI distribution using its actual capabilities.
+[CmdletBinding()]
+param(
+    [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
+    [switch]$RequireQrOcr,
+    [switch]$StageSkill
+)
+$ErrorActionPreference = 'Stop'
+$executable = Join-Path $Root 'src-tauri/target/release/lovelycarve-cli.exe'
+if (-not (Test-Path -LiteralPath $executable)) { throw 'Run just build-cli first.' }
+$capabilities = & $executable --json system | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read CLI capabilities.' }
+if (-not $capabilities.components.inference.available) {
+    throw "The CLI cannot load its inference component: $($capabilities.components.inference.error)"
+}
+if ($RequireQrOcr -and (-not $capabilities.qrcode -or -not $capabilities.ocr)) {
+    throw 'The binary does not enable QR/OCR. Run just build-cli-full before packaging.'
+}
+$version = (Get-Content -LiteralPath (Join-Path $Root 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json).version
+$distRoot = Join-Path $Root 'dist-pack'
+$packageName = "lovelycarve-cli-v$version-win-x64-$(Get-Date -Format yyyyMMdd-HHmmss)-$([Guid]::NewGuid().ToString('N').Substring(0, 6))"
+$stage = Join-Path $distRoot $packageName
+New-Item -ItemType Directory -Path $stage | Out-Null
+Copy-Item -LiteralPath $executable -Destination $stage
+Get-ChildItem -LiteralPath (Join-Path $Root 'src-tauri/binaries') -Filter '*.dll' -File | Where-Object {
+    $_.Name -notin @('libewf.dll', 'libvmdk.dll', 'libbde.dll', 'libvhdi.dll', 'librefs-13.dll', 'bzip2.dll', 'zlib.dll') -and
+    ($capabilities.qrcode -or $_.Name -ne 'opencv_world4130.dll')
+} | Copy-Item -Destination $stage
+# Native components (the inference DLL) the release build put beside the CLI.
+$componentBundle = Get-Content -LiteralPath (Join-Path $Root 'src-tauri/tauri.components.conf.json') -Raw | ConvertFrom-Json
+foreach ($resource in $componentBundle.bundle.resources.PSObject.Properties) {
+    Copy-Item -LiteralPath (Join-Path (Join-Path $Root 'src-tauri') $resource.Name) -Destination (Join-Path $stage $resource.Value)
+}
+foreach ($feature in @('ocr', 'qrcode')) {
+    if ($capabilities.$feature) {
+        $resourcesTarget = Join-Path $stage 'resources'
+        New-Item -ItemType Directory -Force -Path $resourcesTarget | Out-Null
+        Copy-Item -LiteralPath (Join-Path $Root "src-tauri/resources/$feature") -Destination $resourcesTarget -Recurse
+    }
+}
+# lc-plugin-host and the bundled plugins (the set tauri.plugins.conf.json ships).
+$pluginBundle = Get-Content -LiteralPath (Join-Path $Root 'src-tauri/tauri.plugins.conf.json') -Raw | ConvertFrom-Json
+foreach ($resource in $pluginBundle.bundle.resources.PSObject.Properties) {
+    $target = Join-Path $stage $resource.Value
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+    Copy-Item -LiteralPath (Join-Path (Join-Path $Root 'src-tauri') $resource.Name) -Destination $target
+}
+Copy-Item -LiteralPath (Join-Path $Root 'docs/CLI.md') -Destination (Join-Path $stage 'README.md')
+$skillsTarget = Join-Path $stage 'skills'
+New-Item -ItemType Directory -Path $skillsTarget | Out-Null
+$skillSource = Join-Path $Root 'skills/lovelycarve-cli'
+$stagedSkill = Join-Path $skillsTarget 'lovelycarve-cli'
+New-Item -ItemType Directory -Path $stagedSkill | Out-Null
+# The ordinary CLI package already carries the runtime at its root. Do not
+# duplicate a locally staged skill bin/ (or its previous runtime) inside it.
+Get-ChildItem -LiteralPath $skillSource -Force | Where-Object Name -ne 'bin' |
+    Copy-Item -Destination $stagedSkill -Recurse
+Copy-Item -LiteralPath (Join-Path $Root 'LICENSE') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $Root 'THIRD_PARTY_NOTICES.md') -Destination $stage
+$stagedCapabilities = & (Join-Path $stage 'lovelycarve-cli.exe') --json system | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or $stagedCapabilities.qrcode -ne $capabilities.qrcode -or $stagedCapabilities.ocr -ne $capabilities.ocr -or -not $stagedCapabilities.components.inference.available) {
+    throw 'The staged CLI cannot report matching capabilities; check its runtime dependencies.'
+}
+if ($StageSkill) {
+    $runtimeStage = Join-Path $stage 'skill-bin'
+    New-Item -ItemType Directory -Path $runtimeStage | Out-Null
+    Get-ChildItem -LiteralPath $stage -Force | Where-Object Name -notin @('skills', 'skill-bin') |
+        Copy-Item -Destination $runtimeStage -Recurse
+    $skillBin = [IO.Path]::GetFullPath((Join-Path $skillSource 'bin'))
+    $ignoreFile = Join-Path $skillBin '.gitignore'
+    if (Test-Path -LiteralPath $ignoreFile) {
+        Copy-Item -LiteralPath $ignoreFile -Destination $runtimeStage
+    }
+    $runtimeCapabilities = & (Join-Path $runtimeStage 'lovelycarve-cli.exe') --json system | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $runtimeCapabilities.qrcode -ne $capabilities.qrcode -or $runtimeCapabilities.ocr -ne $capabilities.ocr -or -not $runtimeCapabilities.components.inference.available) {
+        throw 'The skill runtime cannot report matching capabilities.'
+    }
+    # Validate every directory move against the requested repository root.
+    # Keep the previous bin intact in dist-pack so refreshes are recoverable.
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $previousBin = [IO.Path]::GetFullPath((Join-Path $stage 'previous-skill-bin'))
+    foreach ($movePath in @($skillBin, $runtimeStage, $previousBin)) {
+        if (-not ([IO.Path]::GetFullPath($movePath)).StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Skill staging path is outside the repository: $movePath"
+        }
+    }
+    $hadPreviousBin = Test-Path -LiteralPath $skillBin
+    if ($hadPreviousBin) {
+        Move-Item -LiteralPath $skillBin -Destination $previousBin
+    }
+    try {
+        Move-Item -LiteralPath $runtimeStage -Destination $skillBin
+    } catch {
+        if ($hadPreviousBin) {
+            Move-Item -LiteralPath $previousBin -Destination $skillBin
+        }
+        throw
+    }
+    Write-Output $skillBin
+    return
+}
+$archive = Join-Path $distRoot "$packageName.zip"
+Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal
+Write-Output $archive
